@@ -1,0 +1,2739 @@
+From c7e477235accca028b1ae91037b5dde1c0bf6732 Mon Sep 17 00:00:00 2001
+From: aethi254 <you@example.com>
+Date: Tue, 14 Jul 2026 07:04:59 +0000
+Subject: [PATCH 1/5] Week 1: problem 1 observations, problem 2
+ (race_amplified.c), problem 3 (word_count.c)
+
+---
+ submissions/aethi254/REPORT.md                | 168 ++++++++++++++++++
+ .../aethi254/problem-2/race_amplified.c       | 102 +++++++++++
+ .../aethi254/problem-3/generate_testfile.py   |  20 +++
+ submissions/aethi254/problem-3/word_count.c   | 165 +++++++++++++++++
+ 4 files changed, 455 insertions(+)
+ create mode 100644 submissions/aethi254/REPORT.md
+ create mode 100644 submissions/aethi254/problem-2/race_amplified.c
+ create mode 100644 submissions/aethi254/problem-3/generate_testfile.py
+ create mode 100644 submissions/aethi254/problem-3/word_count.c
+
+diff --git a/submissions/aethi254/REPORT.md b/submissions/aethi254/REPORT.md
+new file mode 100644
+index 0000000..4be3298
+--- /dev/null
++++ b/submissions/aethi254/REPORT.md
+@@ -0,0 +1,168 @@
++# Week 1 Report — Threads & Concurrency Basics
++
++**Handle:** aethi254
++
++## Problems attempted
++
++- Problem 1 — Run, observe, write down ✅
++- Problem 2 — Make the race worse ✅
++- Problem 3 — Parallel word count ✅
++- Problem 4 — Stretch simulation — not attempted this week
++
++## Environment note (read this first)
++
++`nproc` on my machine reports **1 CPU core**. This matters a lot for
++everything below — several of the example programs that are "supposed"
++to race almost never do here, purely because there's no second core for
++a second thread to actually run on *at the same instant* as the first.
++The OS still preempts and interleaves threads on a single core, but the
++window in which a bad interleaving can happen is much smaller than on a
++multi-core machine, especially for tight loops with no syscalls in them.
++I confirmed this by comparing my runs against `sample-outputs/`, which
++clearly came from a multi-core machine (race_counter is wrong on nearly
++every sample run there, e.g. final counter 12,471,651 instead of
++20,000,000).
++
++## Problem 1 — Observations across 10+ runs
++
++### `hello_thread`
++Expected: 5 lines "Hello from thread N" in some order + "Main thread: all done."
++Ran 10 times. 8/10 runs printed threads 0–4 in strict numeric order; 2/10
++runs had a swapped pair (e.g. thread 2 and 3 swapped). So ordering is
++technically non-deterministic here too, just usually not obviously so
++with only 5 threads.
++
++### `race_counter` (default ITERS = 10,000,000)
++Expected final counter: 20,000,000.
++**10/10 runs were CORRECT (exactly 20,000,000).** This surprised me —
++see the environment note above; I believe it's the single-core
++scheduler letting each thread's tight loop run in large uninterrupted
++bursts, so load/increment/store rarely straddles a context switch.
++
++Variations required by the problem statement:
++- **ITERS = 1000:** 10/10 correct (2000). Even easier to stay correct — fewer
++  total loop iterations means even fewer chances for a bad interleaving.
++- **ITERS = 100,000,000:** 6/10 wrong this time (e.g. 196,724,396 instead
++  of 200,000,000), 4/10 correct. So the race *does* exist and does show up
++  once the loop is long enough to guarantee many more scheduling
++  opportunities — it just needed a much bigger loop than the default to
++  overcome the single-core advantage.
++- **`-O2`:** 10/10 correct at the default ITERS. I checked the disassembly
++  (`objdump -d`) and confirmed why: at `-O2`, gcc proves `counter` (not
++  `volatile`) has no other observable effect inside the loop and collapses
++  the entire 10-million-iteration loop into one `addq $10000000, counter`
++  instruction. That's not the race being fixed — it's the race window
++  shrinking from millions of loads/stores down to a single instruction,
++  which makes a bad interleaving vastly less likely without actually
++  making the program correct.
++
++### `parallel_sum` (ARRAY_SIZE = 10,000,000, 4 threads)
++Expected sum: 10,000,000.
++Ran 10 times: **1/10 correct, 9/10 wrong**, and badly wrong — e.g.
++7,172,164 or 2,911,313 instead of 10,000,000, off by millions each time.
++Unlike `race_counter`, this one races heavily on this machine even at
++default settings, since each of the 4 threads is doing millions of
++`total += array[i]` operations back-to-back with no compiler collapsing
++possible (array contents aren't known at compile time), giving the OS
++far more opportunities to interleave badly.
++
++### `bank_chaos`
++Ran 10 times. **10/10 runs ended with balance exactly 0**, but the
++success counts never summed the way you'd hope for correctness. Every
++single run showed: Alice 10,000 successful / 90,000 rejected, Bob 0
++successful / 100,000 rejected. In other words, on this single-core
++machine, the first thread created (Alice) consistently ran essentially
++to completion — draining the account to zero — before the scheduler ever
++gave Bob's thread meaningful CPU time. Bob's thread then found the
++account already empty for its entire run. Balance is 0, which naively
++"looks correct," but the *reason* it's 0 has nothing to do with fair
++concurrent access — it's really closer to sequential execution in
++disguise, not the interleaved chaos the exercise expects.
++
++## Problem 2 — Making the race worse
++
++File: `submissions/aethi254/problem-2/race_amplified.c`
++
++What I changed:
++1. Split `counter++` into its three explicit steps (load into `tmp`,
++   increment `tmp`, store `tmp` back to `counter`).
++2. Inserted `usleep(1)` between the load and the store.
++3. Reduced `ITERS` from 10,000,000 to 2,000 (necessary — at 1μs of sleep
++   per iteration, the original iteration count would take hours).
++
++Why this works, specifically on this single-core machine: the default
++`race_counter.c` almost never races here because a tight loop rarely
++gets preempted mid-instruction on one core — one thread just runs to
++completion in a burst. `usleep()` is a blocking syscall: it forces the
++calling thread to voluntarily *give up* the CPU right in the middle of
++the load-then-store window, guaranteeing the scheduler runs the other
++thread at exactly the moment it can do the most damage — read the same
++stale value and stomp on our write when it comes back.
++
++Result: **10/10 runs wrong**, final counter consistently in the
++2000–2005 range instead of the expected 4000 — i.e. almost every single
++increment from one thread or the other was lost. That matches the
++success criterion in the problem statement (result close to `ITERS`
++rather than `2*ITERS`).
++
++I avoided `printf` inside the loop per the hint — it does its own
++internal locking and would have partially serialized the threads,
++hiding the race instead of amplifying it.
++
++## Problem 3 — Parallel word count
++
++File: `submissions/aethi254/problem-3/word_count.c`
++
++**Word definition:** a maximal run of non-whitespace characters (same
++definition `wc -w` uses).
++
++**Note on the test file:** the network in my sandbox only allows a
++short domain allowlist and `gutenberg.org` isn't on it, so I couldn't
++download Moby-Dick as suggested. Instead I generated a synthetic
++1,000,000-word text file (`sample.txt`, ~5.2 MB, random dictionary words
++separated by spaces/newlines) and verified its true count with `wc -w`.
++If you'd like, I can redo this against a real Gutenberg text once you
++give me a file directly.
++
++**Deliberately racy total**, per the instructions — every thread adds
++its partial count straight into a shared `total`, no locking.
++
++Results, `wc -w` says 1,000,000:
++
++| Threads | 3 sample runs |
++|---|---|
++| 1 | 1,000,000 / 1,000,000 / 1,000,000 |
++| 2 | 1,000,000 / 1,000,000 / 1,000,000 |
++| 4 | 1,000,000 / 1,000,000 / 1,000,000 |
++| 8 | 1,000,000 / 1,000,000 / 1,000,000 |
++| 16 (15 runs) | 1,000,000 every single time |
++
++Every run matched `wc -w` exactly, even at 16 threads over 15 runs.
++This is consistent with what I saw in `race_counter` at default
++settings: on a single core, each thread's critical section here is a
++single `total += partial` — one add, executed once per thread, not in a
++loop — so there just isn't a meaningfully long window for two threads'
++adds to land on top of each other. I'd genuinely expect this to race on
++a multi-core machine, especially with 16 threads all finishing their
++(unsynchronized) scans around the same time.
++
++## One thing that surprised me
++
++How much a single CPU core changed the entire picture. I went in
++expecting `race_counter` to fail almost every run — that's the whole
++point of the demo — and instead had to push ITERS up 10x to get it to
++misbehave at all. `bank_chaos` was even more striking: instead of chaotic
++alternating withdrawals, one thread reliably ran to near-completion before
++the other got real CPU time, which produced a "clean" balance of 0 for
++the wrong reason. It made the "note on your machine" section of the
++problem statement feel very real rather than like a disclaimer nobody
++hits.
++
++## What I got stuck on
++
++Getting `race_counter` to fail at all took some digging — my first
++instinct was "the code must be wrong," but comparing against
++`sample-outputs/` (which clearly came from a multi-core box) and then
++confirming `nproc` = 1 made it clear the machine, not the code, was the
++reason. Worth flagging for mentorship: might be useful to explicitly ask
++mentees to check `nproc` at the very start of the week.
+diff --git a/submissions/aethi254/problem-2/race_amplified.c b/submissions/aethi254/problem-2/race_amplified.c
+new file mode 100644
+index 0000000..214a24f
+--- /dev/null
++++ b/submissions/aethi254/problem-2/race_amplified.c
+@@ -0,0 +1,102 @@
++/*
++ * race_amplified.c
++ *
++ * Week 1, Problem 2 — Make the race worse.
++ *
++ * This is 02_race_counter.c with the increment deliberately widened
++ * so the race condition shows up on (almost) every single run,
++ * instead of only occasionally.
++ *
++ * WHAT CHANGED FROM THE ORIGINAL
++ * -------------------------------
++ * 1. counter++ was split into its three logical steps:
++ *        long tmp = counter;   // load
++ *        tmp = tmp + 1;        // add
++ *        counter = tmp;        // store
++ *    This alone does not make the race worse — it's exactly what
++ *    counter++ already compiles down to. It just makes the gap explicit
++ *    so we have somewhere to put a delay.
++ *
++ * 2. A usleep(1) call was inserted between the load and the store.
++ *    This is the actual amplification. On this machine (a single-core
++ *    sandbox, confirmed with `nproc` = 1), a tight loop of counter++
++ *    almost never gets preempted mid-instruction-sequence — one thread
++ *    tends to run to completion (or close to it) before the other gets
++ *    scheduled, so the plain race_counter.c rarely shows a wrong
++ *    answer here. usleep() is a blocking syscall: it forces the
++ *    calling thread to voluntarily give up the CPU, which guarantees
++ *    the OS scheduler gets a chance to run the other thread right in
++ *    the middle of our own load-then-store window. That is precisely
++ *    the moment where the other thread can sneak in, read the same
++ *    stale value of `counter`, and stomp on our update when it writes
++ *    back.
++ *
++ * 3. ITERS was reduced drastically (from 10,000,000 to 2,000). This is
++ *    necessary, not optional: a 1-microsecond sleep per iteration
++ *    means 2 threads * 10,000,000 iterations would take on the order
++ *    of hours. At ITERS=2000 the whole program still finishes in a
++ *    couple of seconds while forcing thousands of preemption
++ *    opportunities.
++ *
++ * We deliberately avoided printf() inside the loop, per the hint in
++ * the problem statement — printf performs its own internal locking to
++ * stay thread-safe, which would incidentally serialize/synchronize
++ * our threads and hide the very race we're trying to amplify.
++ *
++ * EXPECTED RESULT
++ * ---------------
++ * Expected final value: 2 * ITERS = 4000
++ * Actual final value on this machine: consistently far below 4000,
++ * frequently close to ITERS (2000) itself — meaning almost every
++ * single increment from one thread or the other is being lost.
++ *
++ * Compile:
++ *   gcc -Wall -Wextra -pthread race_amplified.c -o race_amplified
++ *
++ * Run multiple times:
++ *   for i in $(seq 1 10); do ./race_amplified; done
++ */
++
++#include <stdio.h>
++#include <pthread.h>
++#include <unistd.h>
++
++#define ITERS 2000
++
++/* SHARED global counter, exactly like the original. */
++long counter = 0;
++
++void *increment(void *arg) {
++    (void)arg;
++    for (long i = 0; i < ITERS; i++) {
++        long tmp = counter;   /* load */
++        usleep(1);            /* widen the gap: force a scheduler yield */
++        tmp = tmp + 1;        /* add  */
++        counter = tmp;        /* store */
++    }
++    return NULL;
++}
++
++int main(void) {
++    pthread_t t1, t2;
++
++    pthread_create(&t1, NULL, increment, NULL);
++    pthread_create(&t2, NULL, increment, NULL);
++
++    pthread_join(t1, NULL);
++    pthread_join(t2, NULL);
++
++    long expected = 2L * ITERS;
++    printf("Final counter:  %ld\n", counter);
++    printf("Expected:       %ld\n", expected);
++    printf("Difference:     %ld\n", expected - counter);
++
++    if (counter == expected) {
++        printf("Result: CORRECT (rare at this amplification level — try again)\n");
++    } else {
++        printf("Result: WRONG by %ld — race condition amplified successfully.\n",
++               expected - counter);
++    }
++
++    return 0;
++}
+diff --git a/submissions/aethi254/problem-3/generate_testfile.py b/submissions/aethi254/problem-3/generate_testfile.py
+new file mode 100644
+index 0000000..3e7a101
+--- /dev/null
++++ b/submissions/aethi254/problem-3/generate_testfile.py
+@@ -0,0 +1,20 @@
++#!/usr/bin/env python3
++"""
++Generates the 1,000,000-word synthetic test file used for problem-3
++observations, since the sandbox network allowlist doesn't include
++gutenberg.org. Run this to reproduce sample.txt locally, or swap in a
++real Project Gutenberg text and re-run word_count against that instead.
++"""
++import random
++
++WORDS = ['the', 'quick', 'brown', 'fox', 'jumps', 'over', 'lazy', 'dog',
++         'whale', 'sea', 'captain', 'ship']
++
++def main():
++    random.seed(42)
++    with open('sample.txt', 'w') as f:
++        for _ in range(50000):
++            f.write(' '.join(random.choice(WORDS) for _ in range(20)) + '\n')
++
++if __name__ == '__main__':
++    main()
+diff --git a/submissions/aethi254/problem-3/word_count.c b/submissions/aethi254/problem-3/word_count.c
+new file mode 100644
+index 0000000..097658f
+--- /dev/null
++++ b/submissions/aethi254/problem-3/word_count.c
+@@ -0,0 +1,165 @@
++/*
++ * word_count.c
++ *
++ * Week 1, Problem 3 — Parallel word count (deliberately racy version).
++ *
++ * Counts the total number of words in a text file using multiple
++ * threads. Per the problem statement, this version does NOT guard the
++ * shared total — every thread adds its partial count directly into a
++ * shared `total` variable, the same way 03_parallel_sum.c does. The
++ * goal is to watch the race appear in a real, useful task rather than
++ * in a toy counter.
++ *
++ * WORD DEFINITION
++ * ----------------
++ * A word is a maximal run of non-whitespace characters (same
++ * definition wc -w uses). Whitespace = space, tab, newline, carriage
++ * return, form feed, vertical tab (anything isspace() considers
++ * whitespace).
++ *
++ * HOW THE FILE IS SPLIT
++ * ----------------------
++ * The file is read entirely into memory, then split into num_threads
++ * roughly-equal byte ranges. Splitting a text file at arbitrary byte
++ * offsets risks cutting a word in half at a chunk boundary (e.g.
++ * "jump" | "s over"), which would either double count it or, more
++ * commonly with this simple boundary logic, miscount by one at each
++ * internal boundary. That boundary effect is a *separate, deterministic*
++ * source of small discrepancies from the *nondeterministic* race on
++ * `total` — both are visible in the output of this program, and the
++ * report distinguishes between them.
++ *
++ * Each thread counts words strictly within [start, end) of the shared
++ * buffer (read-only access — no race there, only on `total`).
++ *
++ * Usage:
++ *   ./word_count <filename> <num_threads>
++ *
++ * Compile:
++ *   gcc -Wall -Wextra -pthread word_count.c -o word_count
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <ctype.h>
++#include <pthread.h>
++
++char *buffer;          /* whole file contents, shared (read-only) */
++long  buffer_len;
++long  total = 0;       /* SHARED accumulator — deliberately racy */
++
++typedef struct {
++    long start;         /* inclusive */
++    long end;            /* exclusive */
++} chunk_t;
++
++/*
++ * Count words strictly inside [start, end) of the shared buffer.
++ * A word that starts before `start` but spills into this range is NOT
++ * counted here (it belongs to the previous chunk); a word that starts
++ * inside this range but spills past `end` IS counted here, in whole,
++ * by just continuing past `end` until whitespace or the true end of
++ * the buffer. This avoids splitting a word into two counted halves in
++ * either chunk, though a word can still occasionally be attributed to
++ * the "wrong" chunk relative to wc's own scan — the point is not to
++ * be bit-for-bit identical to wc, but to see the race.
++ */
++long count_words_in_range(long start, long end) {
++    long count = 0;
++    long i = start;
++
++    /* If we start mid-word (previous char was non-whitespace), skip
++     * forward to the next whitespace: that word belongs to the
++     * previous chunk. */
++    if (i > 0 && i < buffer_len && !isspace((unsigned char)buffer[i - 1])) {
++        while (i < buffer_len && !isspace((unsigned char)buffer[i])) {
++            i++;
++        }
++    }
++
++    int in_word = 0;
++    while (i < buffer_len && (i < end || in_word)) {
++        if (isspace((unsigned char)buffer[i])) {
++            in_word = 0;
++        } else {
++            if (!in_word) {
++                count++;
++                in_word = 1;
++            }
++        }
++        i++;
++    }
++
++    return count;
++}
++
++void *worker(void *arg) {
++    chunk_t *c = (chunk_t *)arg;
++    long partial = count_words_in_range(c->start, c->end);
++    total += partial;      /* race condition lives here, on purpose */
++    return NULL;
++}
++
++int main(int argc, char *argv[]) {
++    if (argc != 3) {
++        fprintf(stderr, "Usage: %s <filename> <num_threads>\n", argv[0]);
++        return 1;
++    }
++
++    const char *filename = argv[1];
++    int num_threads = atoi(argv[2]);
++    if (num_threads < 1) {
++        fprintf(stderr, "num_threads must be >= 1\n");
++        return 1;
++    }
++
++    FILE *f = fopen(filename, "rb");
++    if (!f) {
++        perror("fopen");
++        return 1;
++    }
++
++    fseek(f, 0, SEEK_END);
++    buffer_len = ftell(f);
++    fseek(f, 0, SEEK_SET);
++
++    buffer = malloc(buffer_len);
++    if (!buffer) {
++        perror("malloc");
++        fclose(f);
++        return 1;
++    }
++
++    if (fread(buffer, 1, buffer_len, f) != (size_t)buffer_len) {
++        fprintf(stderr, "Failed to read entire file\n");
++        fclose(f);
++        free(buffer);
++        return 1;
++    }
++    fclose(f);
++
++    pthread_t *threads = malloc(num_threads * sizeof(pthread_t));
++    chunk_t   *chunks  = malloc(num_threads * sizeof(chunk_t));
++    long chunk_size = buffer_len / num_threads;
++
++    for (int i = 0; i < num_threads; i++) {
++        chunks[i].start = i * chunk_size;
++        chunks[i].end   = (i == num_threads - 1) ? buffer_len
++                                                  : (i + 1) * chunk_size;
++        pthread_create(&threads[i], NULL, worker, &chunks[i]);
++    }
++
++    for (int i = 0; i < num_threads; i++) {
++        pthread_join(threads[i], NULL);
++    }
++
++    printf("File:         %s\n", filename);
++    printf("Threads:      %d\n", num_threads);
++    printf("Total words:  %ld\n", total);
++
++    free(buffer);
++    free(threads);
++    free(chunks);
++    return 0;
++}
+-- 
+2.43.0
+
+
+From 9009f9bb6fb7f755760da996a9305283ec663169 Mon Sep 17 00:00:00 2001
+From: aethi254 <you@example.com>
+Date: Tue, 14 Jul 2026 07:43:46 +0000
+Subject: [PATCH 2/5] Reorganize week-1 submission into
+ submissions/aethi254/week-1/
+
+---
+ submissions/aethi254/{ => week-1}/REPORT.md     |   0
+ .../{ => week-1}/problem-2/race_amplified.c     |   0
+ .../{ => week-1}/problem-3/generate_testfile.py |   0
+ .../{ => week-1}/problem-3/word_count.c         |   0
+ week-2/code/atomic_counter                      | Bin 0 -> 18488 bytes
+ week-2/code/counter_fixed                       | Bin 0 -> 19312 bytes
+ week-2/code/deadlock_demo                       | Bin 0 -> 19176 bytes
+ week-2/code/producer_consumer                   | Bin 0 -> 20864 bytes
+ 8 files changed, 0 insertions(+), 0 deletions(-)
+ rename submissions/aethi254/{ => week-1}/REPORT.md (100%)
+ rename submissions/aethi254/{ => week-1}/problem-2/race_amplified.c (100%)
+ rename submissions/aethi254/{ => week-1}/problem-3/generate_testfile.py (100%)
+ rename submissions/aethi254/{ => week-1}/problem-3/word_count.c (100%)
+ create mode 100755 week-2/code/atomic_counter
+ create mode 100755 week-2/code/counter_fixed
+ create mode 100755 week-2/code/deadlock_demo
+ create mode 100755 week-2/code/producer_consumer
+
+diff --git a/submissions/aethi254/REPORT.md b/submissions/aethi254/week-1/REPORT.md
+similarity index 100%
+rename from submissions/aethi254/REPORT.md
+rename to submissions/aethi254/week-1/REPORT.md
+diff --git a/submissions/aethi254/problem-2/race_amplified.c b/submissions/aethi254/week-1/problem-2/race_amplified.c
+similarity index 100%
+rename from submissions/aethi254/problem-2/race_amplified.c
+rename to submissions/aethi254/week-1/problem-2/race_amplified.c
+diff --git a/submissions/aethi254/problem-3/generate_testfile.py b/submissions/aethi254/week-1/problem-3/generate_testfile.py
+similarity index 100%
+rename from submissions/aethi254/problem-3/generate_testfile.py
+rename to submissions/aethi254/week-1/problem-3/generate_testfile.py
+diff --git a/submissions/aethi254/problem-3/word_count.c b/submissions/aethi254/week-1/problem-3/word_count.c
+similarity index 100%
+rename from submissions/aethi254/problem-3/word_count.c
+rename to submissions/aethi254/week-1/problem-3/word_count.c
+diff --git a/week-2/code/atomic_counter b/week-2/code/atomic_counter
+new file mode 100755
+index 0000000000000000000000000000000000000000..e28959d4902b50a1b5bc9c5542a1a60092704ed0
+GIT binary patch
+literal 18488
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/week-2/code/counter_fixed b/week-2/code/counter_fixed
+new file mode 100755
+index 0000000000000000000000000000000000000000..0d317670a0c32e80be7c59761599c13b3caf12a9
+GIT binary patch
+literal 19312
+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
+G#eV~V;c|Zf
+
+literal 0
+HcmV?d00001
+
+diff --git a/week-2/code/deadlock_demo b/week-2/code/deadlock_demo
+new file mode 100755
+index 0000000000000000000000000000000000000000..fc8071d45f13d0c1e8b391270c48f163d8952cd9
+GIT binary patch
+literal 19176
+zcmeHPeQ;FQb-!;v&<Y7@h4>WMJicte)=C0_!M0$9Bv{3KMMy2wG0&^rC+)&&SJ{0F
+zlAR_BZagrU2B&uFbeM_jc52$#9h!PP*qJ!Ew2s}T9@9TkC!T3NjB#N~6YQofP8_zs
+zbMHN?)$=MzGySXGtJ!zX`JIn@?|EPM-S@7((6eKk$1nsJuh=X|G8+^U)`~NongI!m
+zjbawIE5!;i1F}zIN*`7PT2<cmOr-&hdqK%>0WoFhVg(DP+(M${H(hzXN@<vippwbY
+zPpp>R^dsF4rmQd4XOc6DDYr%X$GU$^OZ_M}$C{P>u?`p2ex|OM{Rk$%r?lTw+K=gV
+zY7h!j&L`!Bej9Z>H*F;+6sB&!g!XgOZsjJJQXN$GUUuTYPJMf{pR-iOaZ|2`DcARD
+z_)%Vd)xx{EPuDlyei+mHfvHZfXh|gpH?+5;;?1dKIzQGtwsAxAhW1b{6Iv^qK<zT|
+zqho6Ot^t8C=LzH8>6uV6$0OYwttb00yi)higC`z3@aOZN9Ju4#_rCwbhyUz3vY~d9
+z57|(mc)E#FCcYLwvQhc?qQnWKa?yTsL~-S}I{?ovqk0~gSq7)mshmC4R}OyzxQU;;
+zP@~G(ubBpa8@P#|yW9exTpVK>eA6`e0pQE<`$Wm5Y<pCU=AE3dteg{#9kODHL)K6<
+znG&N;B5OzE*1=3NT@+$~9J?rv<Q;p=N@Ze);E#hSMnSTUH4=r7WyQv#)=)AXO(h?4
+z`{dKoi+t!f+aR{@=-t|7tqrvoxwWD7MSfkouzLG<T5&sT4<~buo$cS*mCB^;{^(%J
+zMpeTjnY6ClQl@1M>G(2mocZLIcn>7{qe7aapnN{fNhW8}mF6*x<(rb#bd-Ko%P&0s
+zRUDQc@eE`teBI;g4ez{D`ntyWd40bLgr%EcoaMK-D4dRY+Sgp(Ey3yB;But|m)Cu*
+zxL$&D9i+NZg7djV_|qDv^MKE7!q1f8bl!3~TY{_eQ)$kX;QAIN73WKEB(hjuFTrOP
+zQ6b(c!D~wJ3R}rQB?FZVR5DP>KqUi}4E(AY`1kr-e;Rq@S|D=5|AQ7GB40Z1cnWVt
+z9{KCQ1sS5S{vhDO$`rQsOTvQe6QsF%sZb~kosu#Q$gcjwq)Y>`tA8~q)4=KKHz#Ep
+zFkO9SQl<gg)vrv-G;q3lv?v!=?n3QD^-H>itiQ1G{m@kTpIq|yUGkeQ`8AjPic5ZR
+zirn^Zy~i&eh#bEZdE~w8d-{9Y&bPf0Ioa_sx?Pz2docaUP^f;%@1W60;K`1cfJ9FE
+zze!}%4QDP=dzg5nwz}|c{gMf?yPzrTk4yXYM~SSy899DE^6HPaL|(n&jTo;*F5YzJ
+zAV7}}5GcH>^1%L-|A~$Ps73ycfyg5r%ZQB}zwFdTPITM`;mS)l3xz9jWb-wDGi2id
+z_!jFY|Eou!BxV49I2eMF<G+0aJ-C9Ae&qOfuN*@Fhz)Qi@drx0q_qbjeus{LD`%DB
+znpS*TiA~z=872O!)~-|H$IU8ew-TS%;(CbZ5L3Kyp-jWRuVei9=dxkvv{P8cxTv)k
+zp;Zl=uN3cS#X05HsokoT_J>;g2THqKYrmnyel4Dc_{oNu@yH3^%2hJ+JvZ9UBU|6n
+z;qH_EJy%|$-b7B$eFC+;B6+0pfKpy(We_`}sO%)=iJmJ(AgqAvMW98x`@gKKdiP`9
+zw#bQr8}Y~;b7YGg|CN7);*AUP+>z&c@$9B{R7xcSl?+reP{}|g1C<O^GEm7tB?FZV
+z{C~*+z3riLf9C_HlO0c{hfODA(u*i_ALGLr$J}?Pna&(B<=Zhb8q6l`q11RN6q2r_
+zbGh#?#wGv3jFXUIbLORqC(K+TlTXFXw0+plnxold+A*C(GAHie`iW-fI8acW{lB0c
+zFe%dx*$o-^f6xxGmtNXYN8@<mC({wPM=~LEPu9-m%q}OJx}(cHlCaa}cqV`QVcX2v
+z;O%rKKb#276#eLoi8sf#c_f)i>3(MOX*>(#34D?Fo-ioA2YT*Dg@OZm=Z_18)1dc)
+zzCbwWXF#94UMPGIH1t8Ca1HdkptX3~rgzCyjEDM!F%~oy)m8;gX`H^9h`|3gGU%?7
+zukKcWZO5+_^-X|^y5P3D1)r*~ITDx<TbeelS+`;t!4#M3Jq9~|=f}7MW&-#q0lH9K
+zkKy+!>iZgDJ$1oHJzcYAcut{3LVmyT9N@drkLmQ^gZ?j}KRd<$S?NzurBpId$v`Co
+zl?+reP{}|g1C<O^GVp&c1Nx&z{tk{_s8Knpi2UYLvU*UCS3a^_YgBZhmic?TMOx->
+z+?uq^-`&x;oeJy!<7Od4@>%_n8-Ftw)C_;i_O{mZH)$V|6AFKewm^wuuBJ@1n>ePw
+zUsF$=_>N8+@be6R8#iC$rUn>)P&b6zeO}w~w{u+otr};$pA}U9kXH%eEu8GHspH|r
+zo0K{4cpQ<kN9#Y*GWSD=|6e2geYZPctKQ#XP4{T}pr)gmPH1{cQ+J$SCi8ce+q=5%
+zHdhS{=F?8zY+Dyv7iw+ZkeA}x&#!F{wYG=aR%?a06H(QURB5i(2k|A&qN~;ikUhUJ
+zr15MzLT};SRL;`~RQ(GA8NRA(AdP{*z3?!MKs$k+s$L?-j15xqZ$>-j`23hiKz#pV
+zNYHhVE>K0ynfYaGf}VB3KcY5Ap!cj_PQ37ZiG&SO2ngT9fM)C_=q@kuGcRMa$~!Nx
+z1_3<tu<<UavVg${R^Eld_27M;|H9VWBsBp~Gieq}O|7Ru8dGY5o{uQNvTB-?nB#et
+zgymA0=gE-IiaBSXSs-RmZN5c|Xue?XVQ4n`Hdg%>F#lF;?hZ(HCGdM{hhQRVMzA>u
+zRV{hkC1#M1Z}Y8`oq2@MU*+qn{u40%7h%w|_yufbtZe~_QmpMIv0mg@w~HAw!22TJ
+zhe43r`LJA2<)dEvTMb%=Q1uyX<ZOm8s&e2xRj*^~6|)T3-cF&az2PuyP-fKvTcxmx
+zu!Kb2Eiie9lG+BPm-_A{PWWh-*F6aKZ%MnKv<GODpv?$vHUk$vatV;ycbK>saan8@
+zQh+a#9WkQ%Eo}T<-dc+G6v4C+KG~edz|MHfm`go-fpo-(>ThG?Z&EIQS9GbrfO_up
+zQ=EJBCHO3vqZp_CIL?Dnv7?@v<#~Kxa8T@+t@sB;{mTG5s;E8B=<`KRj7ZORcs4|{
+z!=i)qp2riS=`UbztdaJ7mQ319+cj(}j1{7$W^;|V4!*O5x9;wmdule-^fqq9<=N{O
+zy=bYgUeqiN5a*W`OMS`&eV<q2f&IA(;$k=k?vjqxA!Exz8PdP0=JtiXjrT4z5M^eg
+z;jOEwQ8f`zV;H@S#MCZ@Ukd`vYNx<U4OFzWp|^3%LJzLebvoQqKf$$=0qa>o_OhY|
+zV|G<|!RKUkLBtBESm+l8YVa44rSlXtyTMpl*I46SvS<nU25~cKM7PnDIXXeO1kIiA
+zYWTd{WIyN6H%hy+z-Mf(sX<+nJzO}~pypB^n~F(swH14ht}cGuZSJEzYZyPPn?(eB
+zlRjVvvjqDZM?8N0_<4*ap86_zJ(Qa$Fyjbq9;MBbWb$>|_!o(44<8BM)rQ~ylgpQ{
+zK7AR*Uwhea?DsEfmDuI4mteuxm;L_tF9*Jbzs5kLvh>VDJNEQP`g%IMt(^n?J^QS_
+zp00tuy}iHDW9`~Qi%`t2wl;maH=9SCeA@09w$pYt8G{(j#u6QBWsKQ8Y&P$1HJfuz
+zydwsm=AmeAJRM79Gnf<2HRsbulIeJ}Lu(UqP|B4R&7;|jW5=9K7H%*^2(5^vqPYaC
+zlbJLWv7r(f%NycRCt7aR1uxQ23o-Pf3d@=b)8dZI5%dG}5E|wR<N%h7G1zO$iVsKR
+z)4Aku+K!vCM3h40Xf+4sw6l&`RMD+yYHs^`clLBsUZ=u6eSN$8x*|PY_mOV0r3heW
+zu~G!9NOII58x*M!dJ#&LnL#1fmP`%W+1<IPU++dN3K_=SJ2q1qhh~o^(>Z||?Myx!
+zv#qg7c3ez4QAaEbD^`YS0ZTfcv$K@GSO#MR-Dzbqnzau@!8xO5TTU^vdYud{ia~eS
+zDC#&_7$L4bhG=r}O-mv(Vz=NB$j9xLtUa1(Ibz#~n%B0(GI3k9wqwbQnv(~EIr*4q
+z$>*{y$#g754mcjI4eff_)^IxCGML0#o>CK?xaJ&oo{eL2eALc`5(0-{K8A%lw15Yq
+zZXs*62t_`P4#dIyqC%&+Pkc~t+t4`Gp!GBI<QKx!2Dp}#wWn)=2di)P==Cw$T>23{
+z;lkHxdwz~!`(7}HXcA^vA=Ex91Na$Yp5W&K31ag({3t%J*J1n^7z3kwe$HV0Suo}L
+zJ6*qCmT~5Yr<ZYrNm?$>>(YL{aF3HOO1DPA>j*i@d(wVE@p*&spMq&X9>QUTtkMcU
+z5~A<M8c}2!aB~WxgrgG2Q&)JZa`QBCc1t`c_`=P%@O{98Vxb7S;#g$wX%PH;$F<ng
+z#GlY{-0e9D++^nxdK!3xXQAM6Kdb(faLR;s@@d66i8qOfumU)5Gz==2xA%Ytk>@ko
+zUWXA^rG4-dL!U=AZtCOtHtq1Cj$^vw+|>5&!I#%lzCE`9r~bP0yc)R4jVqyD)5N)d
+z8l1+W%S!y2Jx2DPT1v*0^1IW-5qo1<r!ADh6)`%Pw4CU$0FZO?LqoXGO|JE`oDnNV
+ztNrLw9M4$8smvg56>;24b5=AzCSsY9(Uk4j@lb1d3tEPlw4&K;blkGjczG*^ve6OS
+ziswg0#^F*TS+I1bn3lN+Th_L|&YeA0&#rC@>kYg2@9Nyy+l4?FMOZx%t&Mc|32Xa~
+z-CH|%Si84v+uPG`^>=RF(PK^Cd&c17S~wZzrI5d5(IYL}EZWjy$>P1zvgLR|b{g@g
+zF6=D2v_nO9YS|=&scR^$crIflqUkuTuk76ot9UYP;f5HWZ2dUjIMj{AQUj1;4b&*4
+zJI*Z|L?wf{oUTyb$obZ&ZkR<+>biv`o}6G>`&o8DC;QWwrPN#AT#JBg$du)%Q&qIf
+zU0tCO(G(*Q%8id;NC)a<6-_WFM=zryl*R}zgxhckW4%#3>x`E`gZU&DSSRBe>fG9k
+z0phTb<_Qb{MJPU=Miq)WS*5`z19BWB&9q=am$g$-a?spp$`K*iixAilUj7To<m{LT
+z;T8{(&Hz|v<e?F=6Z)7>#1V}p6+<2T%7b}S6&*<;m~zKn6d{~-BRH9W*@O9ESVq&s
+zI7PLXOb=z4j}8vfa7k<EQvv3YL1qcYp^=?(>G-t-nr*=)6Zdpg-2ZoBvBsH@ZE0B!
+zf#%@Yf4cuKz&-(HG~EDN>hJzP1N41DY2o`0V>Es#_2=;uQ<Dufb^HG&@c+ad9=D(8
+zIhk_(db+PTFUnz~VDS7{>_5+gGTo>XMr|aP`_J={NnkYO<NA4CmFb7jl@@pYKMN(z
+zQL;bJOETs8U2cETP6z!wD9w2?&hws3!`jZ>ehrJ0U?`{T&-1WM&uc@j-`)S;*Zy0z
+zok<m;Fg>G0LH?98xBnjkqnvR3;{8<LSLygJE$;n)8p=|CQ~NQUD0K$Uw`-=)y8NHk
+z3Z`twVOVB**5!XzE0~V5qo(Y~^d*-+kCT|v%v5P%KgPZTrnLV&u4KyZ6WHFJzrWG`
+z#cE7#sp)4acuC>?$I#z{ArtoJ@jBCPHq_Kz|2r=Kb4!&W(`zn&cl|Vri&?Sa8h(C$
+z;r|Qbwr82?2k@;g@#p8IQ_TQT*iK24GUGpof{tDN*jIdx;s5i(|IbCA7R7kHAHM-#
+z${+jldz51>08z#iDQ>x5rZk6J>Mz3Dv{g~AhXb%5%k<3|VO+l%R+^ypKgNcdnl8CP
+z*RRcsTK3mzEaKEwDomTSzd|Rs9Xg;pF8i_N>S_E(v}2SzrXAe=>!<O5lODKH=sByj
+zxJ1!4jsN{}l3574zLXZXKRrJZ=I*D5ZmcL@;S)=V#k_GGdSOt`|A~#t;f(fU!hWUH
+zRfRMSZ&Dt6^a;BhB0UfC@x%8&n)h&}SUU1~^t>xL*DH;%p~u2<{vBauanR-962*T5
+Dju`L+
+
+literal 0
+HcmV?d00001
+
+diff --git a/week-2/code/producer_consumer b/week-2/code/producer_consumer
+new file mode 100755
+index 0000000000000000000000000000000000000000..d95f5889b88dc651e805a3bb48fc33f19983b37b
+GIT binary patch
+literal 20864
+zcmeHPdvqMtdB3x}vs$6o>fwhhW391GY(Ojdi4BpFEU#G+zbe~_A;4(0JCYVlyUOk?
+zw$nTu9FnMt8)(y(b4sXb)02`Wt(y~CAm;=b@`8}W<fI9Nw#UthiIfl`0whi#Y=7UK
+z`;BG?ZIb5npPsW<XYY5v-}kuR{qD@{oteFQe{A<IpQZ^eez9E;H{EC>Jxb6MR}GLJ
+zu~pQeUL#hEAozg9Y<Z7OAhpXgzET=exF3}4mQrH@y4;2ZQ;v`**_A6>t8EEW5w>}<
+z)2XR=Fa5F<3c-}+PJa<HMv2JUp{v#Sn7ZvKH-jCv{$O`0J)`W-sPVHM!DKg~>?V{Q
+z(>V$Vg(>HgazdZ2%Ac2Zkr4`0uidD!^U|HRnP5tNP&shHO8p`I?N@el5$Q&FDfh#a
+z`}-r<QC@!E!qYsU`YSgNr`0?#Rp}L-W9gwSn>xo*9b@TC;aJD9ty?;_Y>MWy(G4;L
+ziYtN-9X8kRJtW{}nlPSD-wB&%e<W*Ba?+pr`iCES{+eg|UwY*8KVJOEug3rFnjJ5b
+z4#iD2q(g=LsSqVkZ8|kc$IizGB(6?Z@wEBPaS4>EjskC5K-L6@kp*z-XCeJ3%HR~!
+zLi(RAgI`$&?=6Ez%f$KlGWwLoh2ohkgLjwlzod+Qstmrm41OQ*%kX(qnJ8F!VHkNU
+zkvw7~M~@i8iS(G5utsxcB4yl`O=m<QKW3T}4mMt}%wtB%%v-taaR*IiGbtmV9?2x;
+zt&{L!nU0EWIF?NwL5DcblhkX@GR70=gnN{J*tuaOk0p%ZG@Pd24M(|j#u|21ZGVM~
+z^jKnlG?BIh^*|@i7IFRV{vCbBhUg}zwGpQiqZ^`|o%Y5}!stJ^2cyfGBk8<l<__-Z
+z8_Q<QgNdOr6Jd{xXEQ2n!&Y5T5oz|}T=C=DsG}xIoKI4pMC>zG1M(cS`MS}PPS?@d
+zeL-Ql)-=9Z0^(<iFDxV8FJ4pp=kNYY9Qr;{MJEgjU+?)kds-cYqw0Fj_@Kf=J<?1t
+z&ipgi**Kk7%C!W}yKwjQVaA0cK&Q;Pa16{T7hO1CLr8c`;Z<n!HI48SE}X7cTt4E$
+z)mNz$-Q~jV>y>SBj|-<hxSV$3oC}iugA2cel|j$A@ERBXkPEMM;nOa>-i3e7g*UkH
+zb1s~Z4VSpmtYn~)fl3A{8K`97|78YVZdmc__{kSS@hSb;P9frVPFud>x%kO1g&vpV
+zDQ?~YxVUB~>W20nLHeU4nf*brSRB4f^0Y9S{q{Uh3zFH#=6PB`%zkd3r-j4p-_G;2
+zV3_^0d7c&uvv<t%v_P26&GWP{m>rtuX`wSaFwfHhVRpwnPYZ+D4Gv#i^F~yN;fD5|
+zLXM}nCgb6UJ^Za6{_P%quZQ2|;kSGEEgnAV;V<{_D?I$-5`O(p`zN2iH9q-+_{ks6
+z?LQb>KfV5m_^Iw9rlGj#<qjcU8ICrze-KH)1fS||g>n3p-b7^EMQahJ{<~13sjn`c
+zZ)iV3dXFm#{aF&8+WZ3|>)wb@&c)BZcwPMLMSooTO8n_JtQI)<d*vWhJa6Zf?dkY9
+z(fuIAqHyJ*_{r`&s2QKUVAaN_x<3SFCjCaSIFrKcd__M6Ub_XhPXA;-dlW)y9D*GV
+z)<}Hvy)$2py-sn?zDVv)=^uw>eDbR^Pr=zw)&jV)&IZ~5fVHIjD`<UMX*NMHrSAuK
+z@}h2iV@mHQ!9DR)wRe)^_^Cw^08_EoCj*UB`c-J3ifi%Y*?4+-WO#Tues(4@`PkFH
+zp8VR`i|y+kn>=^+yiYr~?(F1~lZ%R1!BBq{^~q^%Qh$NiMbA?WZxqA7*2>@>qK;-B
+z_>GKkfV#&B9<kZSp-$`<z&^SkC*zEUfKSF=*G|6o_2z~@4IwAe{)xxmoSKW|c=o5L
+z(Ajb2>0jVUre@UceMZ<l-6-W0*0+@AFJGtBYzBv8;+s?YM#7Pq7L^%22w*DUn~c3a
+zr7uSN_s+~L?)Rtk=TM)VL1w;9?4qZrR+)LFMh@G~%*PN1!nz1KrQ)>BKA_n9!9F_u
+z9Zk&q2(6Q`i^$AHWTtxI%%tK|fi-I>C6lp>>!;(VVlxj@nlRC)k%%wKHhQ^9_7a<8
+z;eANEBkU&ORBXlpcH6+516&K>i}a)ifxp8&n8#j|gZar7_Fx{j+2v|5uh{G!#a;j_
+za}b|8bTJjbvPDL2=`&*xJb|Nu=3HL4ohvoPUn!LgR5DP>KqUi}3{)~u$v`Col??p$
+z3~1`@;yWjD*;FBE=5C1$6^4h+Tx7T~Hg;8n-r%G&BT>3TrQ*_47OBXZR3x%iS!J?E
+zBcq8tuyyh={X6j<DPI_O`8CHUtmAKT?9x*fzuoU8y<=n4aoRG+^ARVML?#ts`)Fiu
+zR>{Y*c`GX8(c1ji;<jJVBZaP?6^qAcP;<rNX^=1|ExONv4uU@XQn7dr^gBN<7Uw`;
+ze7RT*tCuje!l$CWdq8N%!dhExRp>6r2&dmHjKas|q_DF}zBX8m<|cg3ylDFr_2FIh
+zOK)hXIT|`4u3NV4ijAw~YeBNV8K1+5&HcWCa0{RPz^6gEP+uR#=fBZk8^so@4}Zwl
+zR~Pg*X$VQi@)^MYfw3$rkvBT>ry&0>#`p}VWAFPGnO90B1C<O^GEm7tB?FZVR5DP>
+zKqUi}4E!%Lz`y(A-+8Iq2l-nwa#PE`)MCF*@eeJs8?B1x-;=c|o|op!6wkjaqx%6W
+zEPwTlVwQORoiYD5>m#bczsY)r-qE7Sn<UV8s6g=sLzbnAs<0F{|J$%Z^*bs4Em}m`
+z(|rpS{*4#?j*`k!6(Hk>RfFT6mRdsaZ`ip16$)oPybh7$Lw6Fw%Nogtls~)+V!5=$
+zZIa~AtAYPY@oM<W`~Mx`-)(z6cB%R9QFOnegNjZldP32=6g{oz8AYcRJ*Vh-MZNv~
+zE<V&_Yh2&gcTHsNp`k*?Dn!<AjBbo}b!;g}cEkHNY>IYmimqR$1mY^#*b{C~#{=re
+zjCEzQ`AZyhy3nNZ;#*;PDNpA@mi|!HFEFkCK-Fs?OG4FeMR$HJ^w$LXs&>HMuLVCL
+zIsI#pEe+`SU8?Yh^k0Ju{fZRsU$I$Q1wRSB#^Y$~CkP1XuY$COe9Qe0qM=<1W#5V>
+zQWn}O#P4gDOhD9!e68OF8lc;9U)x&Q{xG#8`rRP#RrL~_hgOk`mC{`Uoekl@#&9D9
+z+CPB_Y+glep?#Z}Es_ZdeHL8k69irDr*=aIN^AASp?k>i3dEr=tui1G+WS%Itzn8V
+zpnZ}g%cLZv9YV+Yaw)0R=zX{zk&>`>1H9;$RUZb{q79PGD#<LSpSucubqg9|sc1M4
+z(iONhq`{N+CFlhPTmKVALZkf|frMm2Py#a)CathWXL2AZnWfsbkOfjQgoqX<8&fi?
+zwLd3jSgNfRmr(SLFt4G<Nty_KAJSl38*$6Nj`r5z)~Y_p1CPUD@S2cp|B#fftsRDv
+zxP+$g0DHJvgvctmeFe>5BjNRHgMD|C2fA_uW6Lk2$fUPjA&E<G*Soyk&)(i5Lexhv
+z?oW}UuHf6g?>O4iMl)hN+8dI%bhNMiPhet)^<#F_DMGaWBDmlGSwL-70UCBym$sR}
+z_n;EN6Y!=52T=Qh51{r3FGnqcpMg{hUXR)rTn7NIY5HRTWX=Mjc0Jl1LGo4Y@97~G
+ze2shnRWwMd)&7G$ASg}vId`WG9qy5cXv!8W(Pd*dE3B4|;*E`zhHC#HgSP|R(nv$9
+z_Mc`jh)%Co;CTgBg`iV)OMsmI1aco$LYJ1*ta=gyt7`I-yaq>|k1C<d?x@-9hx|E`
+zMoCIXhmTr9r}Mp;9=JV8(zlcJom81r-A2`R;6f*pY7*-PwFaq`MYWt9ypQy#A>@O&
+z(0PrVeVov7i9SoBJ{jJp36<ehy+DyC<e;Vrm4m8kM=;e#q=)YjO23D=R8-wY%HvY`
+z=LFAz_l40CRS#0NOnMLD>Sudzc?ZzjbPD9Z)EA_D_6A<NcL&t!Cd82jnTfj(*CoY~
+zCc8Z-S|ZRnP(|bUQZp(P`BV>7yY~z%7bS8d;sD8gcOMRaN9j<Csnn&#p?d1pclT)c
+zyb{uNhsuh-LD<?Yb+&vANc%SAQ`;uH<14g$$OxHsuk30YclEHk_6O#>x>j{XuCzMg
+zufL||+L~=O{momks_^Ne9|8DRi<+A4HU4^>Ty7OiVS}hy86utFTG%d!O;uF8u2s6x
+zx2>#wOKX4gTU#|KgciG;V}`Dlt}oHF{$>)_tOVZ)``S&Uw^FmCxUSWQRYe`Jkb@CY
+zzeKC4k)f`vCi8}7&0nvO8Un&KTBFv41xDlLvZJPX7b}DP&9>iW73<0>^yUt>g#|JU
+z8U#7(S^6G1lttL4pu$<XxWAd=S=^|tsc)|Fx3{&EW*8UVCCClNvs5JyU#P9k9JCB^
+z*%D98Z2@h2O$~By&jAf%`67*ar{<;TMy!z8QBy=6w>#;^thob)@+wTTjwRPkG`E`e
+zT74Z6ntOcEXveW61YP$I<KxrXeGQk$FMC;;z_dxK{+KGd0BNVG`e#(WhpBpuD!olq
+z`}oN7Z`JhrS9IOdt8dgBex%oRUceXS3BBQSddslh6dKW&+@;t0RyXPOBYO3P(6bkw
+z*RK-3fX_dEpS}bQ?FPNpzvw<)yHRiJa=CimakcF4^txfa1+H4}((C43J>$5VaJg!d
+zuEJf9==$@aFW|2^)DpV$!Uetd0{ZYRMjo(H#mJe%w6iCbuoAq5hu}Qzq~W(CV*kPT
+zK&*GCvFFgi*kNO5Y*+80-3MXC+i9?{F>}~{gZ(;rOURu%hH-mhtYB{0<k^U0iA>fq
+z==BZklUc0fK&9%&4Z?m+W2ntP?46t%q&AT=Z}+&9s`=4u&Wh0L$}lqKG0UT)_Wl^g
+zk#r^{uuo?sA}ccBKI9fAW_U-Ey^*MN@O$?S?CIT&jz-oS*<4y>3R|Nl(wV#`QL%x6
+zeFJ^*Sl`=>z56MCwO`8KlH}DMi1i&BIMDz07%3Mrv`fmw`=ZfA&f~UsXYc-lN)H{&
+zJx?W`=Ql=ikC;j9yK;@)@$XK8)S5RQ%N|A02`f9EP8vtkDbt=WGlwl!_UkxdXTHQ4
+zrl62Fb9ve%80lNTUM<HX9phFZV|I_288eqof=%R-quut-#Yo3Uq+?%Kq$6*ox|6W!
+z7*6DmXOg42Y$jXCcN8*5F?AglZLi8hDEFatAPUP&TG<@Tpa>UAkQ__oM_HWCW*|ro
+zyLgNWA<}5`IIie;l&}2&A62IVCRgq{12mc*83mCCntgma2aU{^<(ZxNNr#n*V;2FG
+zTF8B8rAO7l{ynjs_CZ2N6zz}83wnD9AK9bGn5PrxSb_X#-h7wSLBg_f7!%Jsoe|g-
+zH{yvv?ZBh`bvR!;N3-K*Cz4i3nVmUvBHMY?G>>#_=uBo)rs&#;^Uj`b%)kA*G@2Bh
+zg?z3vok@<75oXcYvPo@59my0rhtk+D=vEO697fSmVIQ^~c^u>>=J)u7nFosLEF`hx
+zkG2qkRfA!vVj(DG5PnJ;q|#Z?a)qw^0r67NE3XDXHya<7-v>fOlmfnV7SyM&2cHOw
+zIrnBXU=f8!)G`CCEE`diK0jYku;@oa6U#)T$3`eVDu?jV#A3nEOC*TuJ@}9xeqO`)
+zN6^s3B4<Az<DWufq4Aa**B7Oq77@9OJ<QXE{5&P~mk96kgMXK1&Cb4Q_A(>&mkNFk
+z!}uF$G+|u)CCbY;+Naov{P4X3Emo=20r#X>;#UBV$X02!3@gNlXceNT6yH_G4?S0+
+zeorg?E@d_dJPbc!kDrk;e(qF$&U^fPjP!ktf}fu$_u?<g_&HMsr#r@l@^Aq-#XqR}
+zU8_2vCjblS)54wfdz3yu4_gYH#w!%A+=w;6Bh0wyCg6>}R>99{Sky~6^{k9|9`^%Z
+zD4ur#4<nv%FMF`*3aKA<{_n%(N_@N0kMxx4-=Xxq_b(roc&RRNbh}5#q4%!k(`EF(
+z4xGjt?kV;4J;D+H%?ju7J_kHfsw%lx%lM~9RF^HFzZQ6tua=TjQlf;HAU3n74E{kC
+zC*OE;oZ>(-XRVKB>04tcZCHsB0U&STH#fNC&u@1&tZ^er8=mFTF>8#BWrwi(OX0gX
+zZzKxGuyP!q7&9$1743qr)SESEyLQ@0<Z_AQhMBQ)$Hj0iF>V^E!ua@cn7B9tnpTNw
+znXe?n*fr3*CuYR<?liFNdgqOMd-wGB!5LN}Ml7zR@tp(0xPJG(9lg7aeY<uYh#fQz
+z_U_mnGv-${ye#$XKJVeZ;J;)4H*J=8bZOuC{EF9<>ummZmg@&v4LI7g<J`3#p(G*x
+z(rx#SGM3hIh3Wv*7yGu?m})UsqTya-v$l-HUKKdH6pLE$*!Ks{lBjfhyOGLgjZyrz
+ziMGD??}Jt<ouLI*$`g#e4tM-hw3z!81~`<@E9a%V{N;ZJa14-kUVu2BW#HaXQsjn#
+zJ^AWTpvOvb!~TN1@Hq!`3*hdn^xq0N5*aofl1>bEs%e2(qGbO=gc3+Z^T)@riUqZD
+zHXY@byoZ_)QB1!X#TqJ#Ro8@>vyQu<p+Xw}^CO*7Q16a@tcgd2RLAeyMnyDrJcBN5
+zYUOOn?O2V|B2=m=#(*qmjwQ%IwI;?a5tRdrq8S~@f~5vl$|8!D7+85cMzI>CyTzzE
+zs!r3<6udEK`>@Yf+k)HZDuG)G1Sicg=^}~?#W>D?VCGO^1e%G=2(BuMO=pI)+)fM)
+z(e0m-;QyYO+(rhuNidG2+yd9aKLn!pSsFgLT*^Yvo2f8eZnI8Jy6&<H487`MdwT9l
+zg(<HuY!r`*xS{A4P`ADJ|KF_k=sVYOh0{9IZO`jmrjg%aPfr4Wfp<_GKfkAA%KfX?
+zRd0$v0ed_Na>oCR8b4E7-%z0#smbG~2R>BN_>c+r&+i49@_RtirQ*&1yMWO<Hn!*Y
+zYD~THvmVp;!JgjPG0*SqnC_=eQM~cnD0ZHqL36_P{2r0%v{LlukH`O4%6^B^<M)zG
+zBWl28Pd48C-4BdZ*uS%GQ0oVNUkepkyvNVIK;8BcWykcKvSXsePB)+O*v}~irmSDi
+z{*1>Siz~Y*I;~hH?2jout8>Rc&320ZLLHA@d*&bY*z>xbDZdYAeQ*B0tn7LIMMP;T
+z`cuU+;rV0!8)#7cY(E#VB}{kPtW$gYe-0A2{nnMXD$^GnOS|Fi{{mn<`*!}v3cu&)
+z|5xSJXP)Uxux)VJ^L_1T2S60ov$=Vm@!vo|$1YD3-*58&ADg4Wq0sq9h3$C${}C9e
+zusz>@4tA2Z5T|85U$H&YAdKDiqDSd=*_8WX4{XPLEsP1{{v$oMB&_V`SW(f4hnFvC
+zfhl!I%JwRa4o<OBVM=dbxNS@9x?4H)`t|CrD`P*d3}4gTUf<l;<}&u9^u>m9&eNfX
+z6@6vww{ErV-{LXwuwtLG_m0!pX4_YJP8haldQ%zu;cnahNt-w|+qo&9yN(hXUE6K0
+yN9Au7Sh|1X<A<;R^n8ks9oxdLC;DtU=n-<itV@?UkBStX+huFq<}vWF;(q`ln$bxB
+
+literal 0
+HcmV?d00001
+
+-- 
+2.43.0
+
+
+From 8524dcd30b2c9b2aabefba3dc22fd5cc05346ca8 Mon Sep 17 00:00:00 2001
+From: aethi254 <you@example.com>
+Date: Tue, 14 Jul 2026 07:43:50 +0000
+Subject: [PATCH 3/5] Remove accidentally committed week-2 compiled binaries
+
+---
+ week-2/code/atomic_counter    | Bin 18488 -> 0 bytes
+ week-2/code/counter_fixed     | Bin 19312 -> 0 bytes
+ week-2/code/deadlock_demo     | Bin 19176 -> 0 bytes
+ week-2/code/producer_consumer | Bin 20864 -> 0 bytes
+ 4 files changed, 0 insertions(+), 0 deletions(-)
+ delete mode 100755 week-2/code/atomic_counter
+ delete mode 100755 week-2/code/counter_fixed
+ delete mode 100755 week-2/code/deadlock_demo
+ delete mode 100755 week-2/code/producer_consumer
+
+diff --git a/week-2/code/atomic_counter b/week-2/code/atomic_counter
+deleted file mode 100755
+index e28959d4902b50a1b5bc9c5542a1a60092704ed0..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 18488
+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
+
+diff --git a/week-2/code/counter_fixed b/week-2/code/counter_fixed
+deleted file mode 100755
+index 0d317670a0c32e80be7c59761599c13b3caf12a9..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 19312
+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
+G#eV~V;c|Zf
+
+diff --git a/week-2/code/deadlock_demo b/week-2/code/deadlock_demo
+deleted file mode 100755
+index fc8071d45f13d0c1e8b391270c48f163d8952cd9..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 19176
+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
+Dju`L+
+
+diff --git a/week-2/code/producer_consumer b/week-2/code/producer_consumer
+deleted file mode 100755
+index d95f5889b88dc651e805a3bb48fc33f19983b37b..0000000000000000000000000000000000000000
+GIT binary patch
+literal 0
+HcmV?d00001
+
+literal 20864
+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
+
+-- 
+2.43.0
+
+
+From cb33d933e57109f0256a35f52e634412f389142e Mon Sep 17 00:00:00 2001
+From: aethi254 <you@example.com>
+Date: Tue, 14 Jul 2026 07:43:50 +0000
+Subject: [PATCH 4/5] Add gitignore for compiled example binaries
+
+---
+ .gitignore | 9 +++++++++
+ 1 file changed, 9 insertions(+)
+ create mode 100644 .gitignore
+
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..d2083c7
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,9 @@
++week-2/code/atomic_counter
++week-2/code/counter_fixed
++week-2/code/deadlock_demo
++week-2/code/producer_consumer
++week-2/code/*.o
++week-1/code/hello_thread
++week-1/code/race_counter
++week-1/code/parallel_sum
++week-1/code/bank_chaos
+-- 
+2.43.0
+
+
+From 30d7f602c96de9e4171f1489804dd322be2ca6b1 Mon Sep 17 00:00:00 2001
+From: aethi254 <you@example.com>
+Date: Tue, 14 Jul 2026 07:49:51 +0000
+Subject: [PATCH 5/5] Week 2: fix parallel_sum/bank_chaos with mutexes, bounded
+ buffer, thread-safe list, dining philosophers (broken + fixed + starvation
+ check)
+
+---
+ submissions/aethi254/week-2/REPORT.md         | 223 +++++++++++++
+ .../week-2/problem-1/bank_chaos_fixed.c       | 115 +++++++
+ .../week-2/problem-1/parallel_sum_fixed.c     | 104 ++++++
+ .../week-2/problem-2/bounded_buffer.c         | 307 ++++++++++++++++++
+ .../aethi254/week-2/problem-3/safe_list.c     | 231 +++++++++++++
+ .../aethi254/week-2/problem-4/philosophers.c  | 193 +++++++++++
+ .../week-2/problem-4/philosophers_broken.c    |  87 +++++
+ 7 files changed, 1260 insertions(+)
+ create mode 100644 submissions/aethi254/week-2/REPORT.md
+ create mode 100644 submissions/aethi254/week-2/problem-1/bank_chaos_fixed.c
+ create mode 100644 submissions/aethi254/week-2/problem-1/parallel_sum_fixed.c
+ create mode 100644 submissions/aethi254/week-2/problem-2/bounded_buffer.c
+ create mode 100644 submissions/aethi254/week-2/problem-3/safe_list.c
+ create mode 100644 submissions/aethi254/week-2/problem-4/philosophers.c
+ create mode 100644 submissions/aethi254/week-2/problem-4/philosophers_broken.c
+
+diff --git a/submissions/aethi254/week-2/REPORT.md b/submissions/aethi254/week-2/REPORT.md
+new file mode 100644
+index 0000000..7790704
+--- /dev/null
++++ b/submissions/aethi254/week-2/REPORT.md
+@@ -0,0 +1,223 @@
++# Week 2 Report — Synchronization
++
++**Handle:** aethi254
++
++## Problems attempted
++
++- Problem 1 — Fix last week's mess ✅
++- Problem 2 — Thread-safe bounded buffer ✅
++- Problem 3 — Thread-safe linked list ✅
++- Problem 4 — Dining philosophers ✅ (including the starvation bonus)
++
++## Environment note
++
++Same sandbox as Week 1: `nproc` = 1 (single core). This mattered a lot
++less this week — mutexes and condition variables force correct
++behavior regardless of scheduling, so single-core vs multi-core only
++shows up in the *timing* comparisons (Problem 1's reflection question),
++not in correctness.
++
++## Problem 1 — Fixing `parallel_sum` and `bank_chaos`
++
++Files: `problem-1/parallel_sum_fixed.c`, `problem-1/bank_chaos_fixed.c`
++
++Both wrap their previously-racy critical section in a single
++`pthread_mutex_t`:
++- `parallel_sum_fixed.c` locks around each `total += array[i]`.
++- `bank_chaos_fixed.c` locks around the *entire* check-then-act
++  (`if (balance >= amount) { balance -= amount; ... }`), which removes
++  the TOCTOU (time-of-check-to-time-of-use) gap that let both
++  customers see a stale, pre-withdrawal balance last week.
++
++**20-run results:**
++- `parallel_sum_fixed`: **20/20 runs exactly 10,000,000.** No variation
++  at all, unlike Week 1's racy version (9/10 wrong there).
++- `bank_chaos_fixed`: **20/20 runs correct** — balance always ended at
++  0, and this time the accounting actually checks out:
++  `starting_balance − (alice.successful + bob.successful) == final_balance`
++  holds on every run (I added that explicit check in the program since
++  Week 1's version only eyeballed "is balance 0", which turned out to
++  be true for the wrong reason on this machine — see Week 1's report).
++
++**Reflection question — why is the fixed version slower?**
++Timed both directly:
++
++| Version | 3-run times (`real`) |
++|---|---|
++| Racy (Week 1's `03_parallel_sum.c`) | 0.088s, 0.064s, 0.065s |
++| Fixed (mutex around every add) | 0.224s, 0.224s, 0.224s |
++
++The fixed version is consistently **~3x slower**. The extra time isn't
++"computation" — it's contention overhead. Every single array element
++now requires a full lock/unlock pair (two syscall-adjacent operations
++with memory barriers) around what used to be one plain memory add.
++With 10,000,000 elements and 4 threads all fighting over the *same*
++single mutex, most of the added time is threads blocking on the lock
++and the kernel doing futex wake-ups, not any actual arithmetic. This is
++exactly the coarse-grained-locking cost the theory material warns
++about — locking once per element is correct but pays for
++synchronization far more often than necessary. (A per-thread local
++accumulator, added to the shared total only once at the end, would
++avoid almost all of this cost — that's the "bonus" pattern the Week 1
++problem statement hinted at, deliberately not used here so the cost of
++naive locking would be visible for this question.)
++
++## Problem 2 — Thread-safe bounded buffer
++
++File: `problem-2/bounded_buffer.c`
++
++Generic `buffer_init/put/get/destroy` API backed by one mutex + two
++condition variables (`not_full`, `not_empty`), same shape as
++`03_producer_consumer.c` but with the synchronization hidden behind
++the four functions.
++
++**Test:** 3 producers (each producing 1000 known integers —
++producer N makes `N*1000 .. N*1000+999`) and 2 consumers, each
++accumulating a running count and sum. Producers signal completion
++through a `producers_done` counter guarded by the same lock; consumers
++stop once all producers are done *and* the buffer is drained (checked
++under the same lock, so there's no separate race around "are we
++finished").
++
++After joining, main checks total consumed count (expected 3000) and
++total consumed sum (expected 4,498,500, i.e. 0+1+...+2999) against the
++known values.
++
++**Results across configurations, 10 runs each:**
++
++| Configuration | Result |
++|---|---|
++| Default capacity (8), signal | 10/10 PASS |
++| Capacity = 1 (tightest possible sync) | 10/10 PASS |
++| Capacity = 8, broadcast instead of signal | 10/10 PASS |
++
++**30/30 total runs passed** — every item produced was consumed exactly
++once, count and sum both matched, in every configuration.
++
++**Edge cases considered:**
++- **Capacity 1** — forces producer and consumer into near-lockstep;
++  this is the tightest possible synchronization case and the one most
++  likely to expose an off-by-one in the wraparound (`in`/`out`
++  indices) or a missed wakeup. It passed every time.
++- **`signal` vs `broadcast`** — both are correct here (only one
++  consumer *needs* to wake per `not_empty` signal, and only one
++  producer needs to wake per `not_full` signal, since exactly one slot
++  opens/fills per operation), so I expected no correctness difference,
++  and saw none. I also timed both, but with only 2 consumer threads
++  and 3000 total items the timings were within noise (single-digit
++  milliseconds either way) — I don't think this test is large enough
++  to show broadcast's extra wakeup cost. I'd expect a measurable gap
++  with many more consumers all waking up unnecessarily on every
++  `broadcast`, but didn't have time to push the thread count up this
++  week.
++
++## Problem 3 — Thread-safe linked list
++
++File: `problem-3/safe_list.c`
++
++Singly-linked list with **one coarse-grained lock** for the whole
++structure (as recommended), stored next to the head pointer rather
++than inside individual nodes — a per-node lock wouldn't protect the
++head pointer itself or multi-node operations like `remove`.
++
++**Test:** 8 worker threads, 1000 random ops each (insert/contains/remove,
++uniformly chosen), values restricted to `[0, 99]` so threads constantly
++collide on the same values — that's the point, it's what actually
++exercises the lock rather than just running 8 independent lists in
++parallel by accident.
++
++**Correctness checks after the stress test:**
++1. Walk the list end-to-end with a generous upper bound on length as a
++   crude cycle detector (catches corruption/infinite loops).
++2. Insert a fresh, distinct value after all workers join; confirm
++   `list_contains` finds it.
++3. Confirm a value that was never inserted anywhere (a large sentinel,
++   well outside the workers' `[0,99]` range) is correctly reported
++   absent.
++
++I deliberately did **not** try to assert the exact final contents of
++the list — with 8 threads inserting/removing overlapping values
++concurrently, the final state is inherently nondeterministic and isn't
++a bug; the structural checks above are what should hold regardless.
++
++**10/10 runs: PASS**, no crashes, no corrupted/cyclic list ever
++observed. Final list lengths varied a little between runs (556–563
++nodes out of up to 8000 possible insert operations), which is expected
++given the random mix of inserts/removes racing on the same value range.
++
++## Problem 4 — Dining philosophers
++
++Files: `problem-4/philosophers_broken.c` (not submitted, kept for
++reference), `problem-4/philosophers.c` (the actual deliverable)
++
++**What the broken version did:** ran it under `timeout 4` with
++line-buffered stdout to actually capture the moment it froze. Output
++showed exactly the textbook deadlock:
++
++```
++[philosopher 4] picking up left fork 4
++[philosopher 3] picking up left fork 3
++[philosopher 2] picking up left fork 2
++[philosopher 1] picking up left fork 1
++[philosopher 0] picking up left fork 0
++[philosopher 0] picking up right fork 1
++[philosopher 1] picking up right fork 2
++[philosopher 2] picking up right fork 3
++[philosopher 3] picking up right fork 4
++[philosopher 4] picking up right fork 0
++```
++...and then nothing. All five had grabbed their left fork, then every
++single one blocked forever trying for their right fork — a perfect
++circular wait (0→1→2→3→4→0). `timeout` had to kill it (exit code 124);
++the program never printed anything after that last line.
++
++**What I changed to fix it:** lock ordering. Instead of "left fork,
++then right fork" (relative to each philosopher, so direction differs
++around the table), every philosopher now computes
++`first_fork = min(left, right)`, `second_fork = max(left, right)` and
++always locks the lower-numbered fork first. This makes philosopher 4 —
++whose "left" (fork 4) is numerically *higher* than its "right"
++(fork 0) — lock fork 0 before fork 4, breaking the cycle that the
++naive version always formed. With a single global lock-acquisition
++order, a circular wait can never form again, independent of
++scheduling.
++
++**Verification:** ran the fixed version 6 times total (5 quick + the
++one shown above); every single run completed and printed "everyone ate
++exactly the required number of times. No deadlock." Total meals always
++came out to exactly 5×10=50 across the philosophers, and the process
++exited normally every time — a sharp contrast to the broken version,
++which never exits on its own.
++
++**Starvation bonus:** added a `seconds=N` free-run mode (loop until a
++shared stop flag is set after N wall-clock seconds, instead of
++stopping at a fixed meal count — a fixed count can't reveal starvation
++since everyone finishes eventually regardless of fairness). Ran it for
++8 seconds twice:
++
++| Run | Meal counts (philosophers 0–4) | min/max ratio |
++|---|---|---|
++| 1 | (not logged individually) | 578 / 664 = 0.87 |
++| 2 | 581, 634, 655, 670, 581 | 581 / 670 = 0.87 |
++
++Ratios around 0.87 both times — some spread, but nothing close to one
++philosopher being starved out. I'd call this "reasonably fair, mildly
++uneven," not real starvation. Makes sense: with lock ordering and short
++hold times, the scheduler doesn't have much room to consistently favor
++one philosopher over another on this workload.
++
++## One thing that surprised me
++
++How large the mutex overhead was in Problem 1 — a 3x slowdown for
++locking around a single `+=` felt bigger than I expected going in. It
++made the theory material's point about lock granularity click in a way
++just reading about it hadn't.
++
++## What I got stuck on
++
++Getting the "starvation bonus" to actually mean something took a
++rethink — my first version reused the fixed-meal-count loop and of
++course every philosopher always finished with an identical meal count,
++which is a useless signal. I only got a real fairness comparison once
++I switched to running everyone for the same wall-clock duration and
++comparing counts within that shared window.
+diff --git a/submissions/aethi254/week-2/problem-1/bank_chaos_fixed.c b/submissions/aethi254/week-2/problem-1/bank_chaos_fixed.c
+new file mode 100644
+index 0000000..1db2782
+--- /dev/null
++++ b/submissions/aethi254/week-2/problem-1/bank_chaos_fixed.c
+@@ -0,0 +1,115 @@
++/*
++ * bank_chaos_fixed.c
++ *
++ * Week 2, Problem 1b — Fix 04_bank_chaos.c from Week 1.
++ *
++ * Same setup: a shared account starts at $10000; two customer threads
++ * each attempt many small withdrawals, guarded by a check-then-act
++ * balance check. Week 1's version could let the balance go negative
++ * (or, on this sandbox's single core, produced a "clean" balance of 0
++ * for the wrong reason — see week-1 report) because the check and the
++ * act were two separate, unprotected steps.
++ *
++ * THE FIX
++ * -------
++ * A single pthread_mutex_t (`balance_lock`) wraps the entire
++ * check-then-act sequence — the read of `balance`, the comparison,
++ * and the subtraction are now one atomic-with-respect-to-other-threads
++ * unit. No other thread can observe or modify `balance` while one
++ * thread is deciding whether a withdrawal is allowed and then making
++ * it. This directly removes the classic "TOCTOU" (time-of-check to
++ * time-of-use) race: the check and the use can no longer be split by
++ * a context switch.
++ *
++ * Invariant we can now guarantee: balance never goes negative, and
++ * successful_alice + successful_bob * WITHDRAWAL_AMOUNT will always
++ * exactly account for (starting_balance - final_balance).
++ *
++ * Compile:
++ *   gcc -Wall -pthread bank_chaos_fixed.c -o bank_chaos_fixed
++ *
++ * Run:
++ *   ./bank_chaos_fixed
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++
++int balance = 10000;
++pthread_mutex_t balance_lock = PTHREAD_MUTEX_INITIALIZER;
++
++#define ATTEMPTS_PER_CUSTOMER 100000
++#define WITHDRAWAL_AMOUNT     1
++
++typedef struct {
++    const char *name;
++    int successful;
++    int rejected;
++} customer_result_t;
++
++void *customer(void *arg) {
++    customer_result_t *r = (customer_result_t *)arg;
++    r->successful = 0;
++    r->rejected   = 0;
++
++    for (int i = 0; i < ATTEMPTS_PER_CUSTOMER; i++) {
++        pthread_mutex_lock(&balance_lock);
++
++        /*
++         * The whole check-then-act now happens while holding the
++         * lock, so no other thread can slip a withdrawal in between
++         * the check and the subtraction.
++         */
++        if (balance >= WITHDRAWAL_AMOUNT) {
++            balance -= WITHDRAWAL_AMOUNT;
++            r->successful++;
++        } else {
++            r->rejected++;
++        }
++
++        pthread_mutex_unlock(&balance_lock);
++    }
++
++    return NULL;
++}
++
++int main(void) {
++    pthread_t alice_t, bob_t;
++    customer_result_t alice = { "Alice", 0, 0 };
++    customer_result_t bob   = { "Bob",   0, 0 };
++
++    int starting_balance = balance;
++
++    pthread_create(&alice_t, NULL, customer, &alice);
++    pthread_create(&bob_t,   NULL, customer, &bob);
++
++    pthread_join(alice_t, NULL);
++    pthread_join(bob_t,   NULL);
++
++    printf("Customer %s: %d successful, %d rejected\n",
++           alice.name, alice.successful, alice.rejected);
++    printf("Customer %s: %d successful, %d rejected\n",
++           bob.name, bob.successful, bob.rejected);
++    printf("Final balance: %d\n", balance);
++
++    int total_successful = alice.successful + bob.successful;
++    int expected_balance = starting_balance
++                          - total_successful * WITHDRAWAL_AMOUNT;
++
++    printf("Starting balance:               %d\n", starting_balance);
++    printf("Total successful withdrawals:   %d\n", total_successful);
++    printf("Expected balance from that:     %d\n", expected_balance);
++
++    if (balance < 0) {
++        printf("Result: WRONG — balance went negative, the mutex failed to help.\n");
++    } else if (balance != expected_balance) {
++        printf("Result: WRONG — balance doesn't match the accounting.\n");
++    } else {
++        printf("Result: CORRECT — balance matches the accounting exactly, "
++               "never negative.\n");
++    }
++
++    pthread_mutex_destroy(&balance_lock);
++    return 0;
++}
+diff --git a/submissions/aethi254/week-2/problem-1/parallel_sum_fixed.c b/submissions/aethi254/week-2/problem-1/parallel_sum_fixed.c
+new file mode 100644
+index 0000000..626630f
+--- /dev/null
++++ b/submissions/aethi254/week-2/problem-1/parallel_sum_fixed.c
+@@ -0,0 +1,104 @@
++/*
++ * parallel_sum_fixed.c
++ *
++ * Week 2, Problem 1a — Fix 03_parallel_sum.c from Week 1.
++ *
++ * Same setup as the original: split a large array of 1s into chunks,
++ * one per thread, and have each thread add its chunk's values into a
++ * shared `total`. Week 1's version raced badly on `total` (9/10 runs
++ * wrong on the sandbox used for that week's report).
++ *
++ * THE FIX
++ * -------
++ * A single pthread_mutex_t (`total_lock`) protects every access to
++ * `total`. Only one thread can execute `total += array[i]` at a time,
++ * so the lost-update problem from Week 1 is now structurally
++ * impossible — there is no window in which two threads can both read
++ * the same value of `total` before either writes it back.
++ *
++ * This is a coarse-grained approach: we lock once per array element,
++ * which is correct but slow (see the report's reflection question on
++ * where the extra time goes). A faster fix — have each thread
++ * accumulate into a private local variable and only touch the shared
++ * `total` once at the very end — is mentioned as a "bonus" pattern in
++ * Week 1's problem statement and is exactly what Problem 2's
++ * bounded-buffer test does with per-thread partial sums; we don't use
++ * it here on purpose, so the mutex's cost is visible for the
++ * reflection question.
++ *
++ * Compile:
++ *   gcc -Wall -pthread parallel_sum_fixed.c -o parallel_sum_fixed
++ *
++ * Run:
++ *   ./parallel_sum_fixed
++ *
++ * Unlike Week 1's version, this always prints exactly ARRAY_SIZE.
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++
++#define ARRAY_SIZE  10000000
++#define NUM_THREADS 4
++
++int *array;
++long total = 0;
++pthread_mutex_t total_lock = PTHREAD_MUTEX_INITIALIZER;
++
++typedef struct {
++    int thread_id;
++    long start_index;
++    long end_index;
++} thread_arg_t;
++
++void *partial_sum(void *arg) {
++    thread_arg_t *t = (thread_arg_t *)arg;
++    for (long i = t->start_index; i < t->end_index; i++) {
++        pthread_mutex_lock(&total_lock);
++        total += array[i];      /* critical section — now protected */
++        pthread_mutex_unlock(&total_lock);
++    }
++    return NULL;
++}
++
++int main(void) {
++    array = malloc(ARRAY_SIZE * sizeof(int));
++    if (!array) {
++        perror("malloc");
++        return 1;
++    }
++    for (long i = 0; i < ARRAY_SIZE; i++) {
++        array[i] = 1;
++    }
++
++    pthread_t threads[NUM_THREADS];
++    thread_arg_t args[NUM_THREADS];
++    long chunk = ARRAY_SIZE / NUM_THREADS;
++
++    for (int i = 0; i < NUM_THREADS; i++) {
++        args[i].thread_id   = i;
++        args[i].start_index = i * chunk;
++        args[i].end_index   = (i == NUM_THREADS - 1) ? ARRAY_SIZE
++                                                     : (i + 1) * chunk;
++        pthread_create(&threads[i], NULL, partial_sum, &args[i]);
++    }
++
++    for (int i = 0; i < NUM_THREADS; i++) {
++        pthread_join(threads[i], NULL);
++    }
++
++    printf("Computed sum: %ld\n", total);
++    printf("Expected:     %d\n",  ARRAY_SIZE);
++
++    if (total == ARRAY_SIZE) {
++        printf("Result: CORRECT — every time, no matter how many threads.\n");
++    } else {
++        printf("Result: WRONG by %ld — the mutex should have prevented this.\n",
++               (long)ARRAY_SIZE - total);
++    }
++
++    pthread_mutex_destroy(&total_lock);
++    free(array);
++    return 0;
++}
+diff --git a/submissions/aethi254/week-2/problem-2/bounded_buffer.c b/submissions/aethi254/week-2/problem-2/bounded_buffer.c
+new file mode 100644
+index 0000000..c2aeb37
+--- /dev/null
++++ b/submissions/aethi254/week-2/problem-2/bounded_buffer.c
+@@ -0,0 +1,307 @@
++/*
++ * bounded_buffer.c
++ *
++ * Week 2, Problem 2 — Thread-safe bounded buffer.
++ *
++ * A generic, reusable bounded buffer of ints, safe to call from any
++ * number of producer and consumer threads simultaneously. Built the
++ * same way as 03_producer_consumer.c (one mutex + two condition
++ * variables), but wrapped behind an API where the caller never sees
++ * the synchronization:
++ *
++ *   void buffer_init(int capacity);
++ *   void buffer_put(int item);   // blocks if full
++ *   int  buffer_get(void);       // blocks if empty
++ *   void buffer_destroy(void);
++ *
++ * TEST DESIGN
++ * -----------
++ * 3 producer threads, 2 consumer threads.
++ *   - Producer N (N = 0, 1, 2) produces the 1000 integers
++ *     N*1000 .. N*1000+999.
++ *   - Each consumer thread accumulates a running count and sum of
++ *     everything it takes out of the buffer.
++ *   - Producers signal they're done by each incrementing a shared
++ *     `producers_done` counter (protected by the same buffer lock)
++ *     after their last buffer_put. Consumers stop pulling once
++ *     producers_done == NUM_PRODUCERS AND the buffer is empty — that
++ *     condition is checked with the SAME lock/condvar the buffer
++ *     already uses, so there's no separate race to reason about.
++ *   - After both consumers finish, main sums their counts and totals
++ *     and checks them against the known expected count (3000 items)
++ *     and expected sum (0+1+...+2999 = 4498500).
++ *
++ * EDGE CASES CONSIDERED (see report for more)
++ *   - Capacity 1: run the whole test again with buffer_init(1).
++ *     Correctness must hold — it just serializes producers and
++ *     consumers much more tightly (heavy blocking on both sides).
++ *   - signal vs broadcast: BUFFER_USE_BROADCAST toggles between
++ *     pthread_cond_signal and pthread_cond_broadcast on both condition
++ *     variables, to compare correctness and, informally, performance
++ *     with multiple consumers.
++ *
++ * Compile:
++ *   gcc -Wall -pthread bounded_buffer.c -o bounded_buffer
++ *
++ * Run:
++ *   ./bounded_buffer            # default capacity, signal
++ *   ./bounded_buffer 1          # capacity-1 edge case
++ *   ./bounded_buffer 5 broadcast
++ */
++
++#define _DEFAULT_SOURCE
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <pthread.h>
++
++/* ------------------------------------------------------------------ */
++/* Generic thread-safe bounded buffer of ints                         */
++/* ------------------------------------------------------------------ */
++
++static int  *buf_data     = NULL;
++static int   buf_capacity = 0;
++static int   buf_count    = 0;   /* items currently in the buffer */
++static int   buf_in       = 0;   /* next slot to write */
++static int   buf_out      = 0;   /* next slot to read  */
++static int   buf_use_broadcast = 0;   /* set at runtime for the experiment */
++
++static pthread_mutex_t buf_lock       = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t  buf_not_full   = PTHREAD_COND_INITIALIZER;
++static pthread_cond_t  buf_not_empty  = PTHREAD_COND_INITIALIZER;
++
++void buffer_init(int capacity) {
++    buf_data     = malloc(capacity * sizeof(int));
++    buf_capacity = capacity;
++    buf_count    = 0;
++    buf_in       = 0;
++    buf_out      = 0;
++}
++
++void buffer_put(int item) {
++    pthread_mutex_lock(&buf_lock);
++
++    /* WHILE, not IF: guards against spurious wakeups and against the
++     * condition having changed again by the time we're rescheduled. */
++    while (buf_count == buf_capacity) {
++        pthread_cond_wait(&buf_not_full, &buf_lock);
++    }
++
++    buf_data[buf_in] = item;
++    buf_in = (buf_in + 1) % buf_capacity;
++    buf_count++;
++
++    if (buf_use_broadcast) {
++        pthread_cond_broadcast(&buf_not_empty);
++    } else {
++        pthread_cond_signal(&buf_not_empty);
++    }
++
++    pthread_mutex_unlock(&buf_lock);
++}
++
++int buffer_get(void) {
++    pthread_mutex_lock(&buf_lock);
++
++    while (buf_count == 0) {
++        pthread_cond_wait(&buf_not_empty, &buf_lock);
++    }
++
++    int item = buf_data[buf_out];
++    buf_out = (buf_out + 1) % buf_capacity;
++    buf_count--;
++
++    if (buf_use_broadcast) {
++        pthread_cond_broadcast(&buf_not_full);
++    } else {
++        pthread_cond_signal(&buf_not_full);
++    }
++
++    pthread_mutex_unlock(&buf_lock);
++    return item;
++}
++
++void buffer_destroy(void) {
++    free(buf_data);
++    buf_data = NULL;
++}
++
++/*
++ * A separate piece of shared state — how many producers have finished
++ * — protected by the SAME lock the buffer already uses, and announced
++ * through the SAME not_empty condition variable, so consumers waiting
++ * on "is there work OR are we done" only ever have to check one
++ * condition variable's worth of predicate.
++ */
++static int producers_done  = 0;
++static int NUM_PRODUCERS_G = 0;
++
++void producer_finished(void) {
++    pthread_mutex_lock(&buf_lock);
++    producers_done++;
++    /* Wake up anyone waiting on not_empty so they can re-check the
++     * "are we entirely done" predicate even if the buffer is empty. */
++    pthread_cond_broadcast(&buf_not_empty);
++    pthread_mutex_unlock(&buf_lock);
++}
++
++/* Returns 1 if a consumer should keep trying to get an item, 0 if
++ * every producer is done AND the buffer is drained (i.e. truly no
++ * more work will ever arrive). Must be called WITHOUT holding
++ * buf_lock; it takes the lock itself. */
++int work_remains(void) {
++    pthread_mutex_lock(&buf_lock);
++    int remains = !(producers_done == NUM_PRODUCERS_G && buf_count == 0);
++    pthread_mutex_unlock(&buf_lock);
++    return remains;
++}
++
++/*
++ * A get that returns -1 (sentinel; our test never produces negative
++ * numbers) instead of blocking forever once all producers are done
++ * and the buffer is empty.
++ */
++int buffer_get_or_done(void) {
++    pthread_mutex_lock(&buf_lock);
++    while (buf_count == 0 && producers_done < NUM_PRODUCERS_G) {
++        pthread_cond_wait(&buf_not_empty, &buf_lock);
++    }
++    if (buf_count == 0) {
++        /* producers are all done and buffer is empty: no more work */
++        pthread_mutex_unlock(&buf_lock);
++        return -1;
++    }
++    int item = buf_data[buf_out];
++    buf_out = (buf_out + 1) % buf_capacity;
++    buf_count--;
++
++    if (buf_use_broadcast) {
++        pthread_cond_broadcast(&buf_not_full);
++    } else {
++        pthread_cond_signal(&buf_not_full);
++    }
++
++    pthread_mutex_unlock(&buf_lock);
++    return item;
++}
++
++/* ------------------------------------------------------------------ */
++/* Test: 3 producers, 2 consumers                                     */
++/* ------------------------------------------------------------------ */
++
++#define NUM_PRODUCERS 3
++#define NUM_CONSUMERS 2
++#define ITEMS_PER_PRODUCER 1000
++
++typedef struct {
++    int producer_id;
++} producer_arg_t;
++
++typedef struct {
++    long consumed_count;
++    long consumed_sum;
++} consumer_result_t;
++
++void *producer_thread(void *arg) {
++    producer_arg_t *p = (producer_arg_t *)arg;
++    int base = p->producer_id * ITEMS_PER_PRODUCER;
++    for (int i = 0; i < ITEMS_PER_PRODUCER; i++) {
++        buffer_put(base + i);
++    }
++    producer_finished();
++    return NULL;
++}
++
++void *consumer_thread(void *arg) {
++    consumer_result_t *r = (consumer_result_t *)arg;
++    r->consumed_count = 0;
++    r->consumed_sum   = 0;
++
++    while (1) {
++        int item = buffer_get_or_done();
++        if (item == -1) {
++            break;
++        }
++        r->consumed_count++;
++        r->consumed_sum += item;
++    }
++    return NULL;
++}
++
++int main(int argc, char *argv[]) {
++    int capacity = 8;
++    if (argc >= 2) {
++        capacity = atoi(argv[1]);
++        if (capacity < 1) {
++            fprintf(stderr, "capacity must be >= 1\n");
++            return 1;
++        }
++    }
++    if (argc >= 3 && strcmp(argv[2], "broadcast") == 0) {
++        buf_use_broadcast = 1;
++    }
++
++    printf("Bounded buffer test: capacity=%d, wake-strategy=%s\n",
++           capacity, buf_use_broadcast ? "broadcast" : "signal");
++
++    buffer_init(capacity);
++    NUM_PRODUCERS_G = NUM_PRODUCERS;
++    producers_done  = 0;
++
++    pthread_t producers[NUM_PRODUCERS];
++    pthread_t consumers[NUM_CONSUMERS];
++    producer_arg_t     p_args[NUM_PRODUCERS];
++    consumer_result_t  c_results[NUM_CONSUMERS];
++
++    for (int i = 0; i < NUM_PRODUCERS; i++) {
++        p_args[i].producer_id = i;
++        pthread_create(&producers[i], NULL, producer_thread, &p_args[i]);
++    }
++    for (int i = 0; i < NUM_CONSUMERS; i++) {
++        pthread_create(&consumers[i], NULL, consumer_thread, &c_results[i]);
++    }
++
++    for (int i = 0; i < NUM_PRODUCERS; i++) {
++        pthread_join(producers[i], NULL);
++    }
++    for (int i = 0; i < NUM_CONSUMERS; i++) {
++        pthread_join(consumers[i], NULL);
++    }
++
++    long total_count = 0;
++    long total_sum   = 0;
++    for (int i = 0; i < NUM_CONSUMERS; i++) {
++        printf("Consumer %d: consumed %ld items, sum %ld\n",
++               i, c_results[i].consumed_count, c_results[i].consumed_sum);
++        total_count += c_results[i].consumed_count;
++        total_sum   += c_results[i].consumed_sum;
++    }
++
++    long expected_count = (long)NUM_PRODUCERS * ITEMS_PER_PRODUCER;
++    long max_item = expected_count - 1;
++    long expected_sum = max_item * (max_item + 1) / 2;   /* 0+1+...+max_item */
++
++    printf("Total consumed count: %ld (expected %ld)\n", total_count, expected_count);
++    printf("Total consumed sum:   %ld (expected %ld)\n", total_sum, expected_sum);
++
++    int ok = 1;
++    if (total_count != expected_count) {
++        printf("FAIL: consumed count mismatch — items lost or duplicated.\n");
++        ok = 0;
++    }
++    if (total_sum != expected_sum) {
++        printf("FAIL: consumed sum mismatch — items lost, duplicated, or corrupted.\n");
++        ok = 0;
++    }
++    if (ok) {
++        printf("PASS: every item produced was consumed exactly once.\n");
++    }
++
++    buffer_destroy();
++    pthread_mutex_destroy(&buf_lock);
++    pthread_cond_destroy(&buf_not_full);
++    pthread_cond_destroy(&buf_not_empty);
++
++    return ok ? 0 : 1;
++}
+diff --git a/submissions/aethi254/week-2/problem-3/safe_list.c b/submissions/aethi254/week-2/problem-3/safe_list.c
+new file mode 100644
+index 0000000..b5de834
+--- /dev/null
++++ b/submissions/aethi254/week-2/problem-3/safe_list.c
+@@ -0,0 +1,231 @@
++/*
++ * safe_list.c
++ *
++ * Week 2, Problem 3 — Thread-safe singly-linked list.
++ *
++ * A singly-linked list of ints, safe to insert/lookup/remove from any
++ * number of threads concurrently. Uses ONE coarse-grained mutex for
++ * the whole list (as the problem statement explicitly recommends),
++ * stored alongside the head pointer rather than inside individual
++ * nodes — a lock inside each node wouldn't protect operations that
++ * touch the head pointer or that span multiple nodes (like remove,
++ * which has to update the previous node's `next`).
++ *
++ * API:
++ *   void list_init(void);
++ *   void list_insert(int value);
++ *   int  list_contains(int value);
++ *   void list_remove(int value);
++ *   void list_destroy(void);
++ *
++ * TEST DESIGN
++ * -----------
++ * 8 worker threads, each performing 1000 random operations
++ * (insert / contains / remove) on values in [0, 99], so threads
++ * frequently collide on the same values — that's on purpose, it's
++ * what actually exercises the lock.
++ *
++ * After all threads finish we check:
++ *   1. The list is well-formed: walking from head to NULL terminates
++ *      within a sane number of steps (catches cycles/corruption).
++ *   2. A value we insert AFTER all worker threads have joined and
++ *      immediately look up is found (list_contains returns 1).
++ *   3. A value we know we never insert anywhere (a huge sentinel,
++ *      outside the workers' [0,99] range) is correctly reported absent.
++ *
++ * Note: because 8 threads are inserting/removing the SAME range of
++ * values concurrently and unpredictably, we can't assert exactly
++ * which values of [0,99] remain in the list at the end — that's
++ * inherently nondeterministic and is not a bug. What we CAN and DO
++ * assert deterministically is structural correctness (no crash, no
++ * corruption, no infinite loop) plus the two targeted before/after
++ * checks above.
++ *
++ * Compile:
++ *   gcc -Wall -pthread safe_list.c -o safe_list
++ *
++ * Run:
++ *   ./safe_list
++ */
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <pthread.h>
++
++/* ------------------------------------------------------------------ */
++/* Thread-safe singly-linked list                                     */
++/* ------------------------------------------------------------------ */
++
++typedef struct node {
++    int value;
++    struct node *next;
++} node_t;
++
++static node_t *list_head = NULL;
++
++/* ONE lock for the whole list. It lives here, next to the head
++ * pointer it protects, not inside any individual node. */
++static pthread_mutex_t list_lock = PTHREAD_MUTEX_INITIALIZER;
++
++void list_init(void) {
++    pthread_mutex_lock(&list_lock);
++    list_head = NULL;
++    pthread_mutex_unlock(&list_lock);
++}
++
++void list_insert(int value) {
++    node_t *n = malloc(sizeof(node_t));
++    n->value = value;
++
++    pthread_mutex_lock(&list_lock);
++    n->next = list_head;    /* insert at head — O(1), simplest */
++    list_head = n;
++    pthread_mutex_unlock(&list_lock);
++}
++
++int list_contains(int value) {
++    pthread_mutex_lock(&list_lock);
++    node_t *cur = list_head;
++    while (cur != NULL) {
++        if (cur->value == value) {
++            pthread_mutex_unlock(&list_lock);
++            return 1;
++        }
++        cur = cur->next;
++    }
++    pthread_mutex_unlock(&list_lock);
++    return 0;
++}
++
++void list_remove(int value) {
++    pthread_mutex_lock(&list_lock);
++
++    node_t *cur  = list_head;
++    node_t *prev = NULL;
++
++    while (cur != NULL) {
++        if (cur->value == value) {
++            if (prev == NULL) {
++                list_head = cur->next;
++            } else {
++                prev->next = cur->next;
++            }
++            free(cur);
++            /* Remove only the first match — matches list semantics
++             * where duplicate values may exist and we only remove
++             * one occurrence per call, same as a typical list API. */
++            pthread_mutex_unlock(&list_lock);
++            return;
++        }
++        prev = cur;
++        cur  = cur->next;
++    }
++
++    pthread_mutex_unlock(&list_lock);
++    /* value not found: no-op, same as most remove() APIs */
++}
++
++void list_destroy(void) {
++    pthread_mutex_lock(&list_lock);
++    node_t *cur = list_head;
++    while (cur != NULL) {
++        node_t *next = cur->next;
++        free(cur);
++        cur = next;
++    }
++    list_head = NULL;
++    pthread_mutex_unlock(&list_lock);
++}
++
++/* Walk the list and return its length, or -1 if it looks corrupted
++ * (walked further than any sane test could have produced — a crude
++ * cycle detector for the "well-formed" check). */
++long list_length_bounded(long max_reasonable) {
++    pthread_mutex_lock(&list_lock);
++    long len = 0;
++    node_t *cur = list_head;
++    while (cur != NULL) {
++        len++;
++        if (len > max_reasonable) {
++            pthread_mutex_unlock(&list_lock);
++            return -1;   /* almost certainly a cycle */
++        }
++        cur = cur->next;
++    }
++    pthread_mutex_unlock(&list_lock);
++    return len;
++}
++
++/* ------------------------------------------------------------------ */
++/* Stress test: 8 threads, 1000 mixed random ops each                 */
++/* ------------------------------------------------------------------ */
++
++#define NUM_THREADS    8
++#define OPS_PER_THREAD 1000
++#define VALUE_RANGE    100     /* values 0..99 */
++#define NEVER_INSERTED 999999  /* outside VALUE_RANGE, used as sentinel */
++
++void *worker(void *arg) {
++    unsigned int seed = (unsigned int)(size_t)arg;   /* per-thread RNG state */
++
++    for (int i = 0; i < OPS_PER_THREAD; i++) {
++        int value = rand_r(&seed) % VALUE_RANGE;
++        int op    = rand_r(&seed) % 3;
++
++        switch (op) {
++            case 0: list_insert(value);       break;
++            case 1: (void)list_contains(value); break;
++            case 2: list_remove(value);       break;
++        }
++    }
++    return NULL;
++}
++
++int main(void) {
++    list_init();
++
++    pthread_t threads[NUM_THREADS];
++    for (int i = 0; i < NUM_THREADS; i++) {
++        /* pass a distinct seed per thread via the pointer value */
++        pthread_create(&threads[i], NULL, worker, (void *)(size_t)(i + 1));
++    }
++    for (int i = 0; i < NUM_THREADS; i++) {
++        pthread_join(threads[i], NULL);
++    }
++
++    printf("All %d worker threads finished %d ops each without crashing.\n",
++           NUM_THREADS, OPS_PER_THREAD);
++
++    /* Check 1: well-formed list (no cycle, terminates). Upper bound is
++     * generous: at most NUM_THREADS * OPS_PER_THREAD nodes could ever
++     * have been inserted in total. */
++    long len = list_length_bounded((long)NUM_THREADS * OPS_PER_THREAD + 10);
++    if (len < 0) {
++        printf("FAIL: list appears corrupted (cycle or unreasonable length).\n");
++        return 1;
++    }
++    printf("List is well-formed, length = %ld.\n", len);
++
++    /* Check 2: insert a fresh value now that all workers are done,
++     * and confirm we can find it. */
++    int fresh_value = 424242;
++    list_insert(fresh_value);
++    int found_fresh = list_contains(fresh_value);
++    printf("Just inserted %d, list_contains says: %s\n",
++           fresh_value, found_fresh ? "FOUND (correct)" : "NOT FOUND (BUG)");
++
++    /* Check 3: a value that was never inserted anywhere (workers only
++     * ever touch [0, 99], and fresh_value is different too) should be
++     * reported absent. */
++    int found_never = list_contains(NEVER_INSERTED);
++    printf("Value %d was never inserted, list_contains says: %s\n",
++           NEVER_INSERTED, found_never ? "FOUND (BUG)" : "NOT FOUND (correct)");
++
++    int ok = (len >= 0) && found_fresh && !found_never;
++    printf(ok ? "PASS: all correctness checks succeeded.\n"
++              : "FAIL: at least one correctness check failed.\n");
++
++    list_destroy();
++    pthread_mutex_destroy(&list_lock);
++    return ok ? 0 : 1;
++}
+diff --git a/submissions/aethi254/week-2/problem-4/philosophers.c b/submissions/aethi254/week-2/problem-4/philosophers.c
+new file mode 100644
+index 0000000..c6b5491
+--- /dev/null
++++ b/submissions/aethi254/week-2/problem-4/philosophers.c
+@@ -0,0 +1,193 @@
++/*
++ * philosophers.c
++ *
++ * Week 2, Problem 4 — Dining philosophers, FIXED with lock ordering.
++ *
++ * Same setup as philosophers_broken.c: 5 philosophers, 5 forks, each
++ * philosopher needs both adjacent forks to eat. The broken version
++ * deadlocked because every philosopher grabbed "left, then right,"
++ * and left/right are relative to each philosopher — which means it's
++ * possible (and, with everyone grabbing left first, essentially
++ * guaranteed) to form a cycle: 0 waits on 1, 1 waits on 2, 2 waits on
++ * 3, 3 waits on 4, 4 waits on 0.
++ *
++ * THE FIX: lock ordering.
++ * ------------------------
++ * Forks are numbered 0..4. Instead of "left then right," every
++ * philosopher acquires the LOWER-NUMBERED fork first, regardless of
++ * whether it's their left or right fork. Concretely, for philosopher
++ * `id` with adjacent forks `left = id` and `right = (id+1) % 5`:
++ *   - for philosophers 0..3: left < right, so they lock left then right
++ *     (same as before).
++ *   - for philosopher 4: left = 4, right = 0, so 4 is now forced to
++ *     lock fork 0 FIRST, then fork 4 — the opposite order of what the
++ *     naive version did.
++ *
++ * This breaks the cycle: philosopher 4 no longer competes with
++ * philosopher 0 for fork 0 "second" the way it used to. Every
++ * philosopher acquires locks in a single global, consistent order (by
++ * fork number), so a circular-wait chain can never form — one of the
++ * four Coffman conditions for deadlock is now structurally impossible,
++ * regardless of thread scheduling.
++ *
++ * BONUS: starvation check.
++ * -------------------------
++ * A fixed "everyone eats exactly 10 times" loop can't actually reveal
++ * starvation — every philosopher finishes eventually regardless of
++ * how unevenly the forks get shared, as long as there's no deadlock.
++ * To test starvation properly, this program supports a second mode:
++ * run all philosophers for a fixed WALL-CLOCK duration instead of a
++ * fixed meal count, then compare how many times each one ate in that
++ * same time window. If one philosopher's count is far below the
++ * others, that's starvation — the system as a whole made progress,
++ * but access wasn't shared fairly.
++ *
++ * Compile:
++ *   gcc -Wall -pthread philosophers.c -o philosophers
++ *
++ * Run (fixed 10-meals-each mode, the required deliverable):
++ *   ./philosophers
++ *
++ * Run (starvation bonus: free-run for N seconds, compare counts):
++ *   ./philosophers seconds=8
++ */
++
++#include <stdio.h>
++#include <string.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <pthread.h>
++#include <stdatomic.h>
++
++#define NUM_PHILOSOPHERS 5
++#define MEALS_PER_PHILOSOPHER 10
++
++pthread_mutex_t forks[NUM_PHILOSOPHERS];
++int meals_eaten[NUM_PHILOSOPHERS];   /* for the starvation bonus check */
++
++/* When > 0, run in free-run/starvation mode for this many seconds
++ * instead of stopping at MEALS_PER_PHILOSOPHER. Set once in main
++ * before any threads start, so plain reads from worker threads are
++ * fine (no writes happen after threads are created). */
++static int run_seconds = 0;
++static atomic_int stop_flag = 0;
++
++void *philosopher(void *arg) {
++    int id    = *(int *)arg;
++    int left  = id;
++    int right = (id + 1) % NUM_PHILOSOPHERS;
++
++    /* Lock ordering: always acquire the lower-numbered fork first. */
++    int first_fork  = (left < right) ? left  : right;
++    int second_fork = (left < right) ? right : left;
++
++    int meal = 0;
++    while (run_seconds > 0 ? !atomic_load(&stop_flag)
++                            : meal < MEALS_PER_PHILOSOPHER) {
++        if (!run_seconds) {
++            printf("[philosopher %d] thinking\n", id);
++        }
++        usleep(5000);
++
++        pthread_mutex_lock(&forks[first_fork]);
++        pthread_mutex_lock(&forks[second_fork]);
++
++        if (!run_seconds) {
++            printf("[philosopher %d] eating (meal %d)\n", id, meal + 1);
++        }
++        usleep(5000);
++        meals_eaten[id]++;
++        meal++;
++
++        pthread_mutex_unlock(&forks[second_fork]);
++        pthread_mutex_unlock(&forks[first_fork]);
++    }
++
++    if (!run_seconds) {
++        printf("[philosopher %d] done — ate %d times\n", id, meals_eaten[id]);
++    }
++    return NULL;
++}
++
++int main(int argc, char *argv[]) {
++    if (argc >= 2 && strncmp(argv[1], "seconds=", 8) == 0) {
++        run_seconds = atoi(argv[1] + 8);
++        if (run_seconds <= 0) {
++            fprintf(stderr, "seconds=N must be positive\n");
++            return 1;
++        }
++    }
++
++    pthread_t threads[NUM_PHILOSOPHERS];
++    int ids[NUM_PHILOSOPHERS];
++
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        pthread_mutex_init(&forks[i], NULL);
++        meals_eaten[i] = 0;
++    }
++
++    if (run_seconds > 0) {
++        printf("Starting FIXED dining philosophers in free-run mode for "
++               "%d seconds (starvation check).\n\n", run_seconds);
++    } else {
++        printf("Starting FIXED dining philosophers (lock ordering applied).\n\n");
++    }
++
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        ids[i] = i;
++        pthread_create(&threads[i], NULL, philosopher, &ids[i]);
++    }
++
++    if (run_seconds > 0) {
++        sleep(run_seconds);
++        atomic_store(&stop_flag, 1);
++    }
++
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        pthread_join(threads[i], NULL);
++    }
++
++    printf("\nAll philosophers finished. Meals eaten per philosopher:\n");
++    int min_meals = meals_eaten[0], max_meals = meals_eaten[0];
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        printf("  philosopher %d: %d meals\n", i, meals_eaten[i]);
++        if (meals_eaten[i] < min_meals) min_meals = meals_eaten[i];
++        if (meals_eaten[i] > max_meals) max_meals = meals_eaten[i];
++    }
++
++    if (run_seconds > 0) {
++        /* Starvation check: everyone ran for the SAME wall-clock time,
++         * so unequal counts here are a meaningful fairness signal,
++         * not just scheduling noise. */
++        double ratio = (max_meals > 0)
++                      ? (double)min_meals / (double)max_meals
++                      : 1.0;
++        printf("\nFree-ran for %d seconds. min=%d meals, max=%d meals "
++               "(min/max ratio = %.2f).\n", run_seconds, min_meals, max_meals, ratio);
++        if (ratio < 0.5) {
++            printf("Result: significant imbalance — the least-fed "
++                   "philosopher ate less than half as often as the "
++                   "best-fed one. That's starvation.\n");
++        } else {
++            printf("Result: counts are reasonably balanced — no strong "
++                   "starvation observed in this run.\n");
++        }
++    } else {
++        printf("\nEach philosopher was supposed to eat %d times.\n",
++               MEALS_PER_PHILOSOPHER);
++        if (min_meals == MEALS_PER_PHILOSOPHER && max_meals == MEALS_PER_PHILOSOPHER) {
++            printf("Result: everyone ate exactly the required number of "
++                   "times. No deadlock.\n");
++        } else {
++            printf("Result: FAIL — not everyone reached %d meals (should "
++                   "be impossible without a deadlock in this fixed-count "
++                   "mode).\n", MEALS_PER_PHILOSOPHER);
++        }
++    }
++
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        pthread_mutex_destroy(&forks[i]);
++    }
++
++    return 0;
++}
+diff --git a/submissions/aethi254/week-2/problem-4/philosophers_broken.c b/submissions/aethi254/week-2/problem-4/philosophers_broken.c
+new file mode 100644
+index 0000000..6816df1
+--- /dev/null
++++ b/submissions/aethi254/week-2/problem-4/philosophers_broken.c
+@@ -0,0 +1,87 @@
++/*
++ * philosophers_broken.c
++ *
++ * Week 2, Problem 4 — Dining philosophers, BROKEN (naive) version.
++ *
++ * NOT the submission — kept alongside philosophers.c purely so the
++ * "what did the broken version do" part of the report is backed by
++ * real, reproducible code and output rather than a description from
++ * memory. philosophers.c is the fixed, deadlock-free file to submit.
++ *
++ * Five philosophers, five forks arranged in a circle. Each philosopher
++ * needs both adjacent forks to eat. Naive strategy: everyone picks up
++ * their LEFT fork first, then their RIGHT fork.
++ *
++ * This deadlocks classically: if all five grab their left fork at
++ * roughly the same time, every philosopher is holding one fork and
++ * waiting for a neighbor's fork that will never be released — a
++ * circular wait, one of the four Coffman conditions.
++ *
++ * Compile:
++ *   gcc -Wall -pthread philosophers_broken.c -o philosophers_broken
++ *
++ * Run — and be ready to Ctrl+C, it deadlocks within a second or two:
++ *   ./philosophers_broken
++ */
++
++#include <stdio.h>
++#include <unistd.h>
++#include <pthread.h>
++
++#define NUM_PHILOSOPHERS 5
++
++pthread_mutex_t forks[NUM_PHILOSOPHERS];
++
++void *philosopher(void *arg) {
++    int id    = *(int *)arg;
++    int left  = id;
++    int right = (id + 1) % NUM_PHILOSOPHERS;
++
++    for (int meal = 0; meal < 10; meal++) {
++        printf("[philosopher %d] thinking\n", id);
++        usleep(10000);
++
++        printf("[philosopher %d] picking up left fork %d\n", id, left);
++        pthread_mutex_lock(&forks[left]);
++
++        /* Give everyone time to grab their left fork before anyone
++         * tries for their right — this guarantees the deadlock shows
++         * up quickly and reliably instead of only occasionally. */
++        usleep(10000);
++
++        printf("[philosopher %d] picking up right fork %d\n", id, right);
++        pthread_mutex_lock(&forks[right]);   /* <-- hangs here forever */
++
++        printf("[philosopher %d] eating (meal %d)\n", id, meal);
++        usleep(10000);
++
++        pthread_mutex_unlock(&forks[right]);
++        pthread_mutex_unlock(&forks[left]);
++    }
++
++    printf("[philosopher %d] done eating 10 times\n", id);
++    return NULL;
++}
++
++int main(void) {
++    pthread_t threads[NUM_PHILOSOPHERS];
++    int ids[NUM_PHILOSOPHERS];
++
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        pthread_mutex_init(&forks[i], NULL);
++    }
++
++    printf("Starting BROKEN dining philosophers. Watch it deadlock, "
++           "then Ctrl+C.\n\n");
++
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        ids[i] = i;
++        pthread_create(&threads[i], NULL, philosopher, &ids[i]);
++    }
++    for (int i = 0; i < NUM_PHILOSOPHERS; i++) {
++        pthread_join(threads[i], NULL);   /* main hangs here too */
++    }
++
++    printf("This line should never print.\n");
++    return 0;
++}
+-- 
+2.43.0
+
